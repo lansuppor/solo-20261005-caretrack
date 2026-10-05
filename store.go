@@ -96,7 +96,8 @@ func (e Event) toJSON() eventJSON {
 }
 
 func (e eventJSON) toEvent() (Event, error) {
-	t, err := time.Parse(time.RFC3339, e.Time)
+	// 用 RFC3339Nano 解析：既接受整秒，也接受带小数秒的履历时间。
+	t, err := time.Parse(time.RFC3339Nano, e.Time)
 	if err != nil {
 		return Event{}, fmt.Errorf("履历时间格式无效 %q: %w", e.Time, err)
 	}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 const appName = "caretrack"
@@ -28,6 +29,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   close      关闭工单并填写维修结果，设备恢复“可用”
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
   history    按资产查看维修履历（报修、派工、关闭、取消事件）
+  downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
   help       显示本帮助
 
 各命令参数:
@@ -41,6 +43,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
+  downtime --start 起点 --end 终点 [--asset-id 编号]          [--data-dir 目录]
 
 通用参数:
   --data-dir 目录   本地数据目录，默认 ".caretrack"；不同目录数据互不影响，
@@ -66,6 +69,24 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     理由与时间，资产恢复“可用”，可再次报修。取消不代表维修完成，不填写维修结果，
     不删除工单、履历或请求绑定，工单编号不回退也不复用；已取消工单不能关闭或再次
     取消，已关闭工单也不能取消。
+  - downtime 为只读统计，不写文件、不初始化目录、不追加履历、不消耗编号、不改变
+    报修请求绑定。进入统计前先执行整库一致性检查，台账损坏或关联矛盾时按原规则
+    拒绝。
+  - --start/--end 为带时区的 RFC3339 时刻（可含小数秒），起点须早于终点；窗口
+    半开，包含起点、不包含终点，按实际时刻（换算到同一瞬间）比较。
+  - 停机指报修后资产被工单占用的时间：以该工单“报修”履历时间开始，以该工单
+    “关闭”或“取消”履历时间结束（取消前的占用也计入）；派工、转派不另起区间。
+    按工单归属与履历序号配对，不使用数组位置或工单记录中的重复时间字段替代履历
+    时间。未关闭工单暂算到 --end，不取运行时刻，不改变状态；未关闭工单在终点
+    或之后报修记零。
+  - 只统计工单区间与窗口的交集，窗口外及零长度不贡献；同一资产不同工单可能因
+    时间逆序重叠，交集区间取并集后计时，不直接相加；不同资产分别计算。每项资产
+    合计后向下取整为秒，输出编号、名称、停机秒数及各资产秒数之和。没有停机的
+    所选资产显示零；全部查询按资产编号字典序排序，空库提示无记录并显示零合计。
+  - 若所选资产任一“终结”工单（已关闭/已取消）的结束履历时间早于其报修履历时间，
+    即使该单在窗口之外，整次统计也失败，指出资产与工单，不输出部分结果，也不把
+    负时长归零；结束等于开始合法。该检查仅用于本次统计，不因此拒绝原有查询与
+    工单操作，也不自动改写时间。
 
 无参数、--help、-h 显示本帮助；参数错误或业务失败以非零退出码结束并说明原因。
 `
@@ -117,6 +138,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdCancel(args[1:], stdout)
 	case "history":
 		err = cmdHistory(args[1:], stdout)
+	case "downtime":
+		err = cmdDowntime(args[1:], stdout)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q，使用 --help 查看帮助\n", appName, args[0])
 		return 2
@@ -492,5 +515,80 @@ func cmdHistory(args []string, w io.Writer) error {
 		fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n",
 			e.Time.Format("2006-01-02T15:04:05Z07:00"), e.Kind, e.TicketID, e.Content)
 	}
+	return nil
+}
+
+// parseRFC3339Time 解析带时区的 RFC3339 时刻，允许小数秒；失败转成参数错误（退出码 2）。
+func parseRFC3339Time(fs *flag.FlagSet, flagName, value string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, &usageError{
+			msg: fmt.Sprintf("命令 %s 的 --%s 不是有效的 RFC3339 时刻 %q: %v",
+				fs.Name(), flagName, value, err),
+		}
+	}
+	return t, nil
+}
+
+func cmdDowntime(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var startStr, endStr, assetID string
+	fs := newFlagSet("downtime", &opts)
+	fs.StringVar(&startStr, "start", "", "窗口起点（必填，带时区的 RFC3339 时刻，可含小数秒；含起点）")
+	fs.StringVar(&endStr, "end", "", "窗口终点（必填，带时区的 RFC3339 时刻，可含小数秒；不含终点）")
+	fs.StringVar(&assetID, "asset-id", "", "企业资产编号（可选；省略时统计全部资产）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, startStr, "start"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, endStr, "end"); err != nil {
+		return err
+	}
+	windowStart, err := parseRFC3339Time(fs, "start", startStr)
+	if err != nil {
+		return err
+	}
+	windowEnd, err := parseRFC3339Time(fs, "end", endStr)
+	if err != nil {
+		return err
+	}
+	if !windowStart.Before(windowEnd) {
+		return &usageError{msg: "命令 downtime 的 --start 必须早于 --end"}
+	}
+
+	// openStore 已先执行整库一致性检查：损坏或关联矛盾在此被拒绝，统计不会进行。
+	// 只读操作：不写文件、不初始化目录。
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	result, err := s.downtimeStats(assetID, windowStart, windowEnd)
+	if err != nil {
+		return err
+	}
+
+	if assetID == "" {
+		if len(s.data.Assets) == 0 {
+			fmt.Fprintln(w, "没有记录。")
+			fmt.Fprintln(w, "停机合计: 0 秒")
+			return nil
+		}
+		fmt.Fprintf(w, "停机统计（共 %d 项资产，窗口 %s 至 %s，含起点不含终点）:\n",
+			len(result.Lines), startStr, endStr)
+		for _, l := range result.Lines {
+			fmt.Fprintf(w, "%s\t%s\t%d 秒\n", l.AssetID, l.Name, l.Seconds)
+		}
+		fmt.Fprintf(w, "停机合计: %d 秒\n", result.TotalSeconds)
+		return nil
+	}
+
+	// 指定单项资产：没有停机也显示零。
+	l := result.Lines[0]
+	fmt.Fprintf(w, "资产编号: %s\n", l.AssetID)
+	fmt.Fprintf(w, "名称: %s\n", l.Name)
+	fmt.Fprintf(w, "窗口: %s 至 %s（含起点不含终点）\n", startStr, endStr)
+	fmt.Fprintf(w, "停机时长: %d 秒\n", l.Seconds)
 	return nil
 }
