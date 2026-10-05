@@ -30,6 +30,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
   history    按资产查看维修履历（报修、派工、关闭、取消事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
+  import     从另一数据目录批量导入资产及其工单、履历与请求绑定（复制，源只读）
   help       显示本帮助
 
 各命令参数:
@@ -44,6 +45,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
   downtime --start 起点 --end 终点 [--asset-id 编号]          [--data-dir 目录]
+  import   --source-dir 源目录 --asset-id 编号 [--asset-id 编号...]
+                                                              [--data-dir 目录]
 
 通用参数:
   --data-dir 目录   本地数据目录，默认 ".caretrack"；不同目录数据互不影响，
@@ -79,6 +82,15 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     时统计全部资产并按编号字典序排列，空库明确提示无记录并显示零合计。若所选
     资产任一终结工单的结束履历时间早于报修履历时间（即使该单在窗口外、结束
     等于开始合法），整次统计失败，指出资产与工单，不输出部分结果。
+  - import 把源数据目录中所选资产连同全部工单、报修请求绑定与履历复制到目标
+    目录（--data-dir）：源台账始终只读，同一台账不能导入自身；重复编号按一项
+    处理。工单编号按源工单序号升序从目标下一序号重新分配，履历与请求绑定中的
+    工单引用同步替换；履历在目标最大履历序号之后按源序号顺序分配新序号，保留
+    原操作顺序与原时间（含小数秒）。资产编号在目标已存在、或所选工单的任一
+    请求标识已在目标绑定时整批拒绝，不覆盖、不合并。导入后可用原请求标识、
+    资产与描述重放报修，返回映射后的工单及其当前状态；再次导入同一批资产按
+    编号冲突拒绝。任何失败（源不存在、资产不存在、台账损坏、编号或履历序号
+    容量不足、读写失败）都整批失败，两边原文件不变，不消耗目标编号。
 
 无参数、--help、-h 显示本帮助；参数错误或业务失败以非零退出码结束并说明原因。
 参数错误退出码为 2；未知资产、上述时间异常及数据读取失败退出码为 1。
@@ -133,6 +145,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdHistory(args[1:], stdout)
 	case "downtime":
 		err = cmdDowntime(args[1:], stdout)
+	case "import":
+		err = cmdImport(args[1:], stdout)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q，使用 --help 查看帮助\n", appName, args[0])
 		return 2

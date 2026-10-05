@@ -91,7 +91,10 @@ func (e Event) toJSON() eventJSON {
 	return eventJSON{
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
-		Time: e.Time.Format(time.RFC3339),
+		// RFC3339Nano 保留小数秒精度；整秒时输出与 RFC3339 完全一致，
+		// 因此既有整秒台账的字节表示不变，而旧库中带小数秒的履历时间
+		// 在重新保存（含导入合并后的提交）时也不会被截断。
+		Time: e.Time.Format(time.RFC3339Nano),
 	}
 }
 
@@ -147,11 +150,24 @@ func newStoreData() *storeData {
 // openStore 打开数据目录：目录/文件不存在时视为空库（首次保存时初始化）；
 // 已有文件为空或无法解析时报告错误并保留原文件，绝不当空库覆盖。
 func openStore(dir string) (*store, error) {
+	return loadStore(dir, true)
+}
+
+// openSourceStore 以只读用途打开导入源数据目录：与 openStore 做同样的整库
+// 一致性检查，但源台账必须已存在——不存在时报错，绝不能当空库初始化。
+func openSourceStore(dir string) (*store, error) {
+	return loadStore(dir, false)
+}
+
+func loadStore(dir string, allowMissing bool) (*store, error) {
 	path := filepath.Join(dir, dataFileName)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return &store{dir: dir, data: newStoreData(), now: time.Now}, nil
+			if allowMissing {
+				return &store{dir: dir, data: newStoreData(), now: time.Now}, nil
+			}
+			return nil, fmt.Errorf("源数据文件 %s 不存在：源台账必须已存在，不能当空库处理", path)
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
 	}
