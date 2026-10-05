@@ -25,6 +25,10 @@ const (
 	eventReport = "报修"
 	eventClose  = "关闭"
 	eventCancel = "取消"
+	eventAssign = "派工"
+
+	// unassigned 是未派工工单在派工履历中的原负责人标记。
+	unassigned = "未派工"
 
 	storeVersion = 1
 	dataFileName = "caretrack.json"
@@ -43,7 +47,8 @@ type Asset struct {
 	Status   string `json:"status"`
 }
 
-// Ticket 为维修工单。
+// Ticket 为维修工单。Assignee 为当前（或终结时的最终）负责人，空表示未派工；
+// AssignedAt/AssignNote 为最近一次派工的变更时间与说明，仅随派工更新。
 type Ticket struct {
 	ID           string `json:"id"`
 	AssetID      string `json:"asset_id"`
@@ -55,32 +60,42 @@ type Ticket struct {
 	ClosedAt     string `json:"closed_at,omitempty"`
 	CancelReason string `json:"cancel_reason,omitempty"`
 	CancelledAt  string `json:"cancelled_at,omitempty"`
+	Assignee     string `json:"assignee,omitempty"`
+	AssignedAt   string `json:"assigned_at,omitempty"`
+	AssignNote   string `json:"assign_note,omitempty"`
 }
 
-// Event 为履历条目（报修/关闭/取消），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/关闭/取消/派工），Seq 决定操作发生顺序。
+// FromAssignee/ToAssignee 仅派工履历使用，Content 对派工履历为派工说明。
 type Event struct {
-	Seq      int       `json:"-"`
-	AssetID  string    `json:"-"`
-	TicketID string    `json:"-"`
-	Kind     string    `json:"-"`
-	Content  string    `json:"-"`
-	Time     time.Time `json:"-"`
+	Seq          int       `json:"-"`
+	AssetID      string    `json:"-"`
+	TicketID     string    `json:"-"`
+	Kind         string    `json:"-"`
+	Content      string    `json:"-"`
+	FromAssignee string    `json:"-"`
+	ToAssignee   string    `json:"-"`
+	Time         time.Time `json:"-"`
 }
 
 // eventJSON 与 Event 对应，时间以 RFC3339 文本持久化。
 type eventJSON struct {
-	Seq      int    `json:"seq"`
-	AssetID  string `json:"asset_id"`
-	TicketID string `json:"ticket_id"`
-	Kind     string `json:"kind"`
-	Content  string `json:"content"`
-	Time     string `json:"time"`
+	Seq          int    `json:"seq"`
+	AssetID      string `json:"asset_id"`
+	TicketID     string `json:"ticket_id"`
+	Kind         string `json:"kind"`
+	Content      string `json:"content"`
+	FromAssignee string `json:"from_assignee,omitempty"`
+	ToAssignee   string `json:"to_assignee,omitempty"`
+	Time         string `json:"time"`
 }
 
 func (e Event) toJSON() eventJSON {
 	return eventJSON{
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
-		Kind: e.Kind, Content: e.Content, Time: e.Time.Format(time.RFC3339),
+		Kind: e.Kind, Content: e.Content,
+		FromAssignee: e.FromAssignee, ToAssignee: e.ToAssignee,
+		Time: e.Time.Format(time.RFC3339),
 	}
 }
 
@@ -91,7 +106,9 @@ func (e eventJSON) toEvent() (Event, error) {
 	}
 	return Event{
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
-		Kind: e.Kind, Content: e.Content, Time: t,
+		Kind: e.Kind, Content: e.Content,
+		FromAssignee: e.FromAssignee, ToAssignee: e.ToAssignee,
+		Time: t,
 	}, nil
 }
 
@@ -237,6 +254,13 @@ func validateData(d *storeData) error {
 		if t.Status != ticketCancelled && (t.CancelReason != "" || t.CancelledAt != "") {
 			return fmt.Errorf("状态矛盾：非已取消工单 %s 不应带有取消理由或取消时间", t.ID)
 		}
+		if t.Assignee == "" {
+			if t.AssignedAt != "" || t.AssignNote != "" {
+				return fmt.Errorf("状态矛盾：未派工工单 %s 不应带有派工时间或派工说明", t.ID)
+			}
+		} else if t.AssignedAt == "" || t.AssignNote == "" {
+			return fmt.Errorf("状态矛盾：已派工工单 %s 缺少派工时间或派工说明", t.ID)
+		}
 		if tickets[t.ID] != nil {
 			return fmt.Errorf("数据矛盾：工单编号 %s 重复", t.ID)
 		}
@@ -306,6 +330,7 @@ func validateData(d *storeData) error {
 	reportCount := map[string]int{}
 	closeCount := map[string]int{}
 	cancelCount := map[string]int{}
+	assignEvents := map[string][]Event{}
 	for i := range d.Events {
 		e := &d.Events[i]
 		if e.Seq < 1 {
@@ -326,6 +351,9 @@ func validateData(d *storeData) error {
 			return fmt.Errorf("履历矛盾：履历序号 %d 的资产 %s 与工单 %s 归属的资产 %s 不一致",
 				e.Seq, e.AssetID, t.ID, t.AssetID)
 		}
+		if e.Kind != eventAssign && (e.FromAssignee != "" || e.ToAssignee != "") {
+			return fmt.Errorf("履历矛盾：非派工履历序号 %d 不应带有负责人字段", e.Seq)
+		}
 		switch e.Kind {
 		case eventReport:
 			if e.Content != t.Description {
@@ -345,6 +373,14 @@ func validateData(d *storeData) error {
 			}
 			cancelCount[t.ID]++
 			cancelSeq[t.ID] = e.Seq
+		case eventAssign:
+			if e.FromAssignee == "" || e.ToAssignee == "" {
+				return fmt.Errorf("履历矛盾：派工履历序号 %d 缺少原负责人或新负责人", e.Seq)
+			}
+			if e.FromAssignee == e.ToAssignee {
+				return fmt.Errorf("履历矛盾：派工履历序号 %d 的新负责人与原负责人相同", e.Seq)
+			}
+			assignEvents[t.ID] = append(assignEvents[t.ID], *e)
 		default:
 			return fmt.Errorf("履历矛盾：履历序号 %d 的事件类型无效 %q", e.Seq, e.Kind)
 		}
@@ -374,6 +410,41 @@ func validateData(d *storeData) error {
 			}
 		} else if cancelCount[t.ID] != 0 {
 			return fmt.Errorf("履历矛盾：非已取消工单 %s 不得有取消履历", t.ID)
+		}
+		// 派工链：变更必须发生在该单报修之后、终结之前；原负责人须接续上次
+		// 记录（首次派工的原负责人为“未派工”），新负责人非空且不同于原负责人。
+		chain := assignEvents[t.ID]
+		if len(chain) > 0 {
+			sort.Slice(chain, func(i, j int) bool { return chain[i].Seq < chain[j].Seq })
+			if chain[0].Seq <= reportSeq[t.ID] {
+				return fmt.Errorf("履历矛盾：工单 %s 的派工履历（序号 %d）不在报修履历（序号 %d）之后",
+					t.ID, chain[0].Seq, reportSeq[t.ID])
+			}
+			if t.Status == ticketClosed && chain[len(chain)-1].Seq >= closeSeq[t.ID] {
+				return fmt.Errorf("履历矛盾：工单 %s 的派工履历（序号 %d）不在关闭履历（序号 %d）之前",
+					t.ID, chain[len(chain)-1].Seq, closeSeq[t.ID])
+			}
+			if t.Status == ticketCancelled && chain[len(chain)-1].Seq >= cancelSeq[t.ID] {
+				return fmt.Errorf("履历矛盾：工单 %s 的派工履历（序号 %d）不在取消履历（序号 %d）之前",
+					t.ID, chain[len(chain)-1].Seq, cancelSeq[t.ID])
+			}
+			prev := unassigned
+			for _, ev := range chain {
+				if ev.FromAssignee != prev {
+					return fmt.Errorf("履历矛盾：工单 %s 的派工履历（序号 %d）原负责人为 %s，未接续上次记录的 %s",
+						t.ID, ev.Seq, ev.FromAssignee, prev)
+				}
+				prev = ev.ToAssignee
+			}
+		}
+		// 由履历推出的最后负责人须与工单记录一致；无派工履历则必须未派工。
+		derived := ""
+		if len(chain) > 0 {
+			derived = chain[len(chain)-1].ToAssignee
+		}
+		if derived != t.Assignee {
+			return fmt.Errorf("状态矛盾：按派工履历推出工单 %s 的负责人为 %s，与工单记录的 %s 不一致",
+				t.ID, displayAssignee(derived), displayAssignee(t.Assignee))
 		}
 	}
 	// 按履历序号推进，重放得到的工单与资产状态须与保存的状态相符；
@@ -407,6 +478,8 @@ func validateData(d *storeData) error {
 			}
 			derivedTicket[e.TicketID] = ticketCancelled
 			delete(derivedOpen, e.AssetID)
+		case eventAssign:
+			// 派工不改变工单与资产状态，派工链已在前面单独校验。
 		}
 	}
 	for _, t := range d.Tickets {
@@ -644,6 +717,54 @@ func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 	asset.Status = statusAvailable
 	s.appendEvent(eventSeq, asset.ID, t.ID, eventClose, result)
 	return t, asset, nil
+}
+
+// displayAssignee 把空的负责人字段显示为“未派工”。
+func displayAssignee(assignee string) string {
+	if assignee == "" {
+		return unassigned
+	}
+	return assignee
+}
+
+// assignTicket 为未关闭工单派工或转派：无负责人时首次派工，已有负责人时转派。
+// 保存负责人、变更时间与说明，并追加含原负责人、新负责人及说明的派工履历
+// （首次派工的原负责人记为“未派工”）。不创建工单、不消耗工单编号，不改变
+// 资产状态或报修请求绑定。失败路径不修改任何业务数据。
+func (s *store) assignTicket(ticketID, assignee, note string) (*Ticket, error) {
+	t := s.findTicket(ticketID)
+	if t == nil {
+		return nil, fmt.Errorf("%w: 未知工单编号 %q", errNotFound, ticketID)
+	}
+	if t.Status == ticketClosed {
+		return nil, fmt.Errorf("%w: 工单 %s 已关闭，不能派工", errConflict, ticketID)
+	}
+	if t.Status == ticketCancelled {
+		return nil, fmt.Errorf("%w: 工单 %s 已取消，不能派工", errConflict, ticketID)
+	}
+	if t.Assignee == assignee {
+		return nil, fmt.Errorf("%w: 工单 %s 的负责人已是 %s，不能重复派给同一人员", errConflict, ticketID, assignee)
+	}
+	eventSeq, err := s.nextEventSeq()
+	if err != nil {
+		return nil, err
+	}
+	from := displayAssignee(t.Assignee)
+	now := s.now()
+	t.Assignee = assignee
+	t.AssignedAt = now.Format(time.RFC3339)
+	t.AssignNote = note
+	s.data.Events = append(s.data.Events, Event{
+		Seq:          eventSeq,
+		AssetID:      t.AssetID,
+		TicketID:     t.ID,
+		Kind:         eventAssign,
+		Content:      note,
+		FromAssignee: from,
+		ToAssignee:   assignee,
+		Time:         now,
+	})
+	return t, nil
 }
 
 // cancelTicket 取消未关闭工单并把资产恢复为可用。取消是终态，但不代表维修完成：

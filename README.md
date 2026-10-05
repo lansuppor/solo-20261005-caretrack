@@ -46,7 +46,8 @@ caretrack list
 caretrack detail --asset-id EQ-001
 ```
 
-显示资产信息、当前状态，以及未关闭工单编号（无则显示“无”）。
+显示资产信息、当前状态，以及未关闭工单编号与其负责人（未派工时显示“未派工”，
+无未关闭工单时显示“无”）。
 
 ### 报修
 
@@ -64,6 +65,30 @@ caretrack report --asset-id EQ-001 --description 频繁卡纸 --request-id req-2
     也不影响之后的新工单。
 - 失败的新报修不会绑定请求标识；已有绑定保持不变。
 - 每项资产最多有一张未关闭工单。
+
+### 派工与转派
+
+```sh
+caretrack assign --ticket-id T0001 --assignee 张三 --note 联系用户后上门
+```
+
+- 仅未关闭工单可派工：无负责人时为首次派工，已有负责人时为转派，
+  新负责人须非空且不同于当前负责人，说明不能为空。
+- 维修人员标识仅作本地文本记录，无需人员账户。
+- 成功时输出工单编号与负责人，保存负责人、变更时间与说明，并追加一条
+  含原负责人、新负责人及说明的派工履历（首次派工的原负责人记为“未派工”）。
+- 派工不创建工单、不消耗工单编号，不改变资产状态或报修请求绑定。
+- 未知工单、空人员或说明、重复派给当前人员、已关闭或已取消工单均拒绝，
+  且不产生履历；工单关闭或取消后保留最后负责人与派工履历。
+
+### 查询工单
+
+```sh
+caretrack ticket --ticket-id T0001
+```
+
+显示工单状态与负责人（未派工、当前或最终负责人）；已派工时同时显示
+最近派工时间与说明。
 
 ### 关闭工单
 
@@ -93,8 +118,9 @@ caretrack cancel --ticket-id T0001 --reason 误报，设备实际正常
 caretrack history --asset-id EQ-001
 ```
 
-按操作发生顺序展示该资产的报修、关闭、取消事件，包含所属工单编号、时间和内容
-（取消事件展示取消理由）；失败操作不产生履历。无履历时明确提示。
+按操作发生顺序展示该资产的报修、派工、关闭、取消事件，包含所属工单编号、
+时间和内容（派工事件展示原负责人、新负责人与说明，取消事件展示取消理由）；
+失败操作不产生履历。无履历时明确提示。
 
 ## 完整示例
 
@@ -102,6 +128,9 @@ caretrack history --asset-id EQ-001
 D=/tmp/caretrack-data
 caretrack register --data-dir $D --asset-id EQ-001 --name 打印机 --location 一楼大厅
 caretrack report   --data-dir $D --asset-id EQ-001 --description 频繁卡纸 --request-id req-1
+caretrack assign   --data-dir $D --ticket-id T0001 --assignee 张三 --note 联系用户后上门
+caretrack assign   --data-dir $D --ticket-id T0001 --assignee 李四 --note 张三请假，转李四
+caretrack ticket   --data-dir $D --ticket-id T0001
 caretrack detail   --data-dir $D --asset-id EQ-001
 caretrack cancel   --data-dir $D --ticket-id T0001 --reason 误报，设备实际正常
 caretrack report   --data-dir $D --asset-id EQ-001 --description 无法开机 --request-id req-2
@@ -112,8 +141,11 @@ caretrack history  --data-dir $D --asset-id EQ-001
 ## 损坏与矛盾数据的处理
 
 - 数据文件为空、不是有效 JSON，或 JSON 能解析但业务记录相互矛盾（计数器、
-  请求绑定、状态、履历中的任一类）时，所有读取与写入命令都报错并以退出码 1
-  结束，错误信息会指出问题类别。
+  请求绑定、状态、履历、派工链中的任一类）时，所有读取与写入命令都报错并以
+  退出码 1 结束，错误信息会指出问题类别。派工链要求：派工变更发生在该单
+  报修之后、终结之前，原负责人接续上次记录（首次为“未派工”），新负责人非空
+  且不同于原负责人，由履历推出的最后负责人与工单记录一致。
+- 无派工字段的有效旧台账无需转换，加载后按未派工继续使用。
 - 工具不做任何自动修复，也不提供修复入口：不补字段、不重编号、不删除记录，
   原文件字节保持不变。请人工修正 `caretrack.json`（或从备份恢复）后再继续使用。
 - 每次写入前会再次校验待提交数据；校验或读写失败不会留下部分业务变化，
