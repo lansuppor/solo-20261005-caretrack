@@ -59,6 +59,19 @@ func appendTo(m map[string]any, key string, v any) {
 	m[key] = append(m[key].([]any), v)
 }
 
+// cancelLedger 把 baseLedger 中的 T0001 改为合法的已取消终态（含取消履历、资产可用）。
+func cancelLedger(m map[string]any) {
+	tk := m["tickets"].([]any)[0].(map[string]any)
+	tk["status"] = "已取消"
+	tk["cancel_reason"] = "误报，设备实际正常"
+	tk["cancelled_at"] = "2026-10-01T11:00:00Z"
+	m["assets"].([]any)[0].(map[string]any)["status"] = "可用"
+	appendTo(m, "events", map[string]any{
+		"seq": 4, "asset_id": "EQ-1", "ticket_id": "T0001",
+		"kind": "取消", "content": "误报，设备实际正常", "time": "2026-10-01T11:00:00Z",
+	})
+}
+
 // 有效旧库（编号与履历序号有间隔）应继续加载，编号从计数器延续，去重保持。
 func TestValidLegacyStoreWithGaps(t *testing.T) {
 	dir := t.TempDir()
@@ -226,6 +239,47 @@ func TestContradictoryLedgersRejected(t *testing.T) {
 		{"工单描述为空", func(m map[string]any) {
 			m["tickets"].([]any)[0].(map[string]any)["description"] = ""
 		}, "数据矛盾"},
+		{"已取消工单缺少取消理由", func(m map[string]any) {
+			cancelLedger(m)
+			delete(m["tickets"].([]any)[0].(map[string]any), "cancel_reason")
+		}, "状态矛盾"},
+		{"已取消工单带有维修结果", func(m map[string]any) {
+			cancelLedger(m)
+			m["tickets"].([]any)[0].(map[string]any)["result"] = "已修复"
+		}, "状态矛盾"},
+		{"未取消工单带有取消理由", func(m map[string]any) {
+			m["tickets"].([]any)[0].(map[string]any)["cancel_reason"] = "误报"
+		}, "状态矛盾"},
+		{"已取消工单仍占用资产", func(m map[string]any) {
+			cancelLedger(m)
+			m["assets"].([]any)[0].(map[string]any)["status"] = "维修中"
+		}, "状态矛盾"},
+		{"已取消工单缺少取消履历", func(m map[string]any) {
+			tk := m["tickets"].([]any)[0].(map[string]any)
+			tk["status"] = "已取消"
+			tk["cancel_reason"] = "误报"
+			tk["cancelled_at"] = "2026-10-01T11:00:00Z"
+			m["assets"].([]any)[0].(map[string]any)["status"] = "可用"
+		}, "履历矛盾"},
+		{"已取消工单同时有关闭履历", func(m map[string]any) {
+			cancelLedger(m)
+			appendTo(m, "events", eventJSONMap(5, "T0001", "关闭", "已修复"))
+		}, "履历矛盾"},
+		{"未关闭工单有取消履历", func(m map[string]any) {
+			appendTo(m, "events", eventJSONMap(4, "T0001", "取消", "误报"))
+		}, "履历矛盾"},
+		{"取消履历内容与取消理由不一致", func(m map[string]any) {
+			cancelLedger(m)
+			m["events"].([]any)[1].(map[string]any)["content"] = "别的理由"
+		}, "履历矛盾"},
+		{"取消履历早于报修履历", func(m map[string]any) {
+			cancelLedger(m)
+			m["events"].([]any)[1].(map[string]any)["seq"] = 2
+		}, "履历矛盾"},
+		{"取消履历重复", func(m map[string]any) {
+			cancelLedger(m)
+			appendTo(m, "events", eventJSONMap(5, "T0001", "取消", "误报，设备实际正常"))
+		}, "履历矛盾"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -454,6 +508,126 @@ func TestEventSeqExhaustion(t *testing.T) {
 	}
 	if s.data.NextTicketSeq != 5 || len(s.data.Tickets) != 1 || len(s.data.Requests) != 1 {
 		t.Fatal("失败的报修不应消耗工单编号或绑定请求标识")
+	}
+}
+
+// 含已取消工单的有效旧台账无需转换即可加载：去重重放返回已取消状态，
+// 新报修从计数器延续编号，取消后资产可再次报修，重启后状态保持。
+func TestValidCancelledLegacyLedger(t *testing.T) {
+	dir := t.TempDir()
+	writeLedger(t, dir, cancelLedger)
+
+	s, err := openStore(dir)
+	if err != nil {
+		t.Fatalf("含已取消工单的有效旧库应能加载: %v", err)
+	}
+	// 重放旧请求：返回原工单的已取消状态，不产生工单或履历，不重新占用资产。
+	old, replay, err := s.report("EQ-1", "卡纸", "req-1")
+	if err != nil || !replay || old.ID != "T0001" || old.Status != ticketCancelled {
+		t.Fatalf("重放应返回已取消的 T0001: %v replay=%v err=%v", old, replay, err)
+	}
+	if len(s.data.Tickets) != 1 || len(s.data.Events) != 2 {
+		t.Fatal("重放不应产生工单或履历")
+	}
+	if got := s.findAsset("EQ-1").Status; got != statusAvailable {
+		t.Fatalf("重放不应重新占用资产，状态 = %q", got)
+	}
+	// 新报修从计数器 5 延续编号。
+	tk, replay, err := s.report("EQ-1", "无法开机", "req-2")
+	if err != nil || replay || tk.ID != "T0005" {
+		t.Fatalf("新报修应开出 T0005: %v replay=%v err=%v", tk, replay, err)
+	}
+	// 旧请求重放不影响新单。
+	old, replay, err = s.report("EQ-1", "卡纸", "req-1")
+	if err != nil || !replay || old.Status != ticketCancelled {
+		t.Fatalf("已有新单时重放仍返回已取消的 T0001: %v replay=%v err=%v", old, replay, err)
+	}
+	if got := s.openTicketOf("EQ-1"); got == nil || got.ID != "T0005" {
+		t.Fatalf("新工单 T0005 应仍为未关闭，得到 %v", got)
+	}
+	// 取消新工单并保存重开：取消状态、理由、履历与去重结果保持。
+	if _, _, err := s.cancelTicket("T0005", "用户自行解决"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s2.findTicket("T0005")
+	if got.Status != ticketCancelled || got.CancelReason != "用户自行解决" || got.CancelledAt == "" {
+		t.Fatalf("重开后 T0005 取消状态未保持: %+v", got)
+	}
+	if got := s2.findTicket("T0001"); got.Status != ticketCancelled ||
+		got.CancelReason != "误报，设备实际正常" {
+		t.Fatalf("重开后 T0001 取消状态未保持: %+v", got)
+	}
+	events := s2.eventsOf("EQ-1")
+	if len(events) != 4 || events[0].Kind != eventReport || events[1].Kind != eventCancel ||
+		events[2].Kind != eventReport || events[3].Kind != eventCancel {
+		t.Fatalf("重开后履历不对: %+v", events)
+	}
+	if events[1].Content != "误报，设备实际正常" || events[3].Content != "用户自行解决" {
+		t.Fatalf("取消履历内容应为取消理由: %+v", events)
+	}
+	// 同标识搭配不同资产或描述仍被拒绝，取消不释放旧请求标识。
+	if _, _, err := s2.report("EQ-1", "别的故障", "req-1"); err == nil {
+		t.Fatal("同标识不同描述应被拒绝")
+	}
+}
+
+// 工单编号耗尽时仍可取消已有工单。
+func TestTicketNumberExhaustionAllowsCancel(t *testing.T) {
+	dir := t.TempDir()
+	writeLedger(t, dir, func(m map[string]any) { m["next_ticket_seq"] = math.MaxInt })
+
+	var out, errBuf bytes.Buffer
+	code := run([]string{"cancel", "--data-dir", dir, "--ticket-id", "T0001", "--reason", "误报"},
+		&out, &errBuf)
+	if code != 0 {
+		t.Fatalf("编号耗尽时取消已有工单应可用: %s", errBuf.String())
+	}
+	if !strings.Contains(out.String(), "T0001") || !strings.Contains(out.String(), "已取消") {
+		t.Fatalf("取消输出应包含原工单编号与已取消状态: %s", out.String())
+	}
+	s, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.findTicket("T0001"); got.Status != ticketCancelled {
+		t.Fatalf("取消后状态 = %q", got.Status)
+	}
+	// 取消后新报修仍因编号耗尽被拒绝。
+	if _, _, err := s.report("EQ-1", "新故障", "req-2"); err == nil {
+		t.Fatal("编号耗尽时新报修应继续被拒绝")
+	}
+}
+
+// 履历序号耗尽时取消失败，不留下部分变化，原文件字节不变。
+func TestEventSeqExhaustionRejectsCancel(t *testing.T) {
+	dir := t.TempDir()
+	raw := writeLedger(t, dir, func(m map[string]any) {
+		m["events"].([]any)[0].(map[string]any)["seq"] = math.MaxInt
+	})
+	s, err := openStore(dir)
+	if err != nil {
+		t.Fatalf("合法台账应能加载: %v", err)
+	}
+	if _, _, err := s.cancelTicket("T0001", "误报"); err == nil ||
+		!strings.Contains(err.Error(), "履历序号") {
+		t.Fatalf("履历序号耗尽应拒绝取消，得到 %v", err)
+	}
+	if got := s.findTicket("T0001"); got.Status != ticketOpen {
+		t.Fatal("失败的取消不应改动工单状态")
+	}
+	if got := s.findAsset("EQ-1").Status; got != statusRepairing {
+		t.Fatal("失败的取消不应改动资产状态")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, dataFileName))
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatal("失败的取消不应改动原文件")
 	}
 }
 

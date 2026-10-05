@@ -60,7 +60,8 @@ caretrack report --asset-id EQ-001 --description 频繁卡纸 --request-id req-2
   既不是资产编号也不是工单编号：
   - 相同标识 + 相同资产 + 相同描述再次提交：返回原工单及当前状态，不新增记录。
   - 相同标识搭配不同资产或不同描述：拒绝。
-  - 原工单关闭后重放：仍返回原工单（已关闭状态），不重开旧单，也不影响之后的新工单。
+  - 原工单关闭或取消后重放：仍返回原工单及其当前状态，不重开旧单，
+    也不影响之后的新工单。
 - 失败的新报修不会绑定请求标识；已有绑定保持不变。
 - 每项资产最多有一张未关闭工单。
 
@@ -73,14 +74,27 @@ caretrack close --ticket-id T0001 --repair-result 已更换搓纸轮
 仅未关闭工单可关闭，维修结果不能为空；成功后设备恢复“可用”，并写入一条关闭履历。
 未知工单、空维修结果、重复关闭均失败且不改动记录。
 
+### 取消工单
+
+```sh
+caretrack cancel --ticket-id T0001 --reason 误报，设备实际正常
+```
+
+用于取消误报或不再需要维修的工单。仅未关闭工单可取消，取消理由不能为空；
+成功后工单进入“已取消”终态，保存取消理由与时间，设备恢复“可用”，
+详情中的未关闭工单显示“无”，可再次报修开出新工单，并写入一条取消履历。
+取消不代表维修完成：不填写维修结果，不删除工单、履历或请求绑定，
+工单编号不回退也不复用。未知工单、空理由、已取消或已关闭工单的取消均失败
+且不改动记录；已取消工单也不能再关闭。
+
 ### 维修履历
 
 ```sh
 caretrack history --asset-id EQ-001
 ```
 
-按操作发生顺序展示该资产的报修、关闭事件，包含所属工单编号、时间和内容；
-失败操作不产生履历。无履历时明确提示。
+按操作发生顺序展示该资产的报修、关闭、取消事件，包含所属工单编号、时间和内容
+（取消事件展示取消理由）；失败操作不产生履历。无履历时明确提示。
 
 ## 完整示例
 
@@ -89,7 +103,9 @@ D=/tmp/caretrack-data
 caretrack register --data-dir $D --asset-id EQ-001 --name 打印机 --location 一楼大厅
 caretrack report   --data-dir $D --asset-id EQ-001 --description 频繁卡纸 --request-id req-1
 caretrack detail   --data-dir $D --asset-id EQ-001
-caretrack close    --data-dir $D --ticket-id T0001 --repair-result 已更换搓纸轮
+caretrack cancel   --data-dir $D --ticket-id T0001 --reason 误报，设备实际正常
+caretrack report   --data-dir $D --asset-id EQ-001 --description 无法开机 --request-id req-2
+caretrack close    --data-dir $D --ticket-id T0002 --repair-result 已更换电源
 caretrack history  --data-dir $D --asset-id EQ-001
 ```
 

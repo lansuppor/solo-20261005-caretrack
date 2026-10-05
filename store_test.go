@@ -153,6 +153,109 @@ func TestReportLifecycleAndDedup(t *testing.T) {
 	}
 }
 
+func TestCancelLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.registerAsset("EQ-1", "打印机", "一楼"); err != nil {
+		t.Fatal(err)
+	}
+	tk, _, err := s.report("EQ-1", "卡纸", "req-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 未知工单取消失败，不产生任何变化。
+	if _, _, err := s.cancelTicket("T9999", "误报"); !errors.Is(err, errNotFound) {
+		t.Fatalf("未知工单取消应失败，得到 %v", err)
+	}
+	if got := len(s.eventsOf("EQ-1")); got != 1 {
+		t.Fatalf("失败的取消不应产生履历，履历数 = %d", got)
+	}
+
+	// 取消未关闭工单：进入已取消终态，保存理由与时间，资产恢复可用。
+	cancelled, asset, err := s.cancelTicket(tk.ID, "误报，设备实际正常")
+	if err != nil {
+		t.Fatalf("cancelTicket: %v", err)
+	}
+	if cancelled.Status != ticketCancelled || cancelled.CancelReason != "误报，设备实际正常" ||
+		cancelled.CancelledAt == "" {
+		t.Fatalf("取消后工单状态异常: %+v", cancelled)
+	}
+	if cancelled.Result != "" || cancelled.ClosedAt != "" {
+		t.Fatal("取消不应填写维修结果或关闭时间")
+	}
+	if asset.Status != statusAvailable {
+		t.Fatalf("取消后资产状态 = %q", asset.Status)
+	}
+	if got := s.openTicketOf("EQ-1"); got != nil {
+		t.Fatalf("取消后不应有未关闭工单，得到 %v", got)
+	}
+
+	// 已取消工单不能再次取消，也不能关闭。
+	if _, _, err := s.cancelTicket(tk.ID, "再次取消"); !errors.Is(err, errConflict) {
+		t.Fatalf("重复取消应失败，得到 %v", err)
+	}
+	if _, _, err := s.closeTicket(tk.ID, "结果"); !errors.Is(err, errConflict) {
+		t.Fatalf("已取消工单关闭应失败，得到 %v", err)
+	}
+
+	// 资产可用后可用新请求开新工单，编号不复用。
+	tk2, replay, err := s.report("EQ-1", "无法开机", "req-2")
+	if err != nil || replay || tk2.ID != "T0002" {
+		t.Fatalf("取消后新报修应开出 T0002: %v replay=%v err=%v", tk2, replay, err)
+	}
+
+	// 旧请求重放返回原工单的已取消状态，不产生记录，不影响新单。
+	old, replay, err := s.report("EQ-1", "卡纸", "req-1")
+	if err != nil || !replay || old.ID != "T0001" || old.Status != ticketCancelled {
+		t.Fatalf("重放应返回已取消的 T0001: %v replay=%v err=%v", old, replay, err)
+	}
+	if len(s.data.Tickets) != 2 || len(s.data.Requests) != 2 {
+		t.Fatalf("重放不应增加记录: tickets=%d requests=%d", len(s.data.Tickets), len(s.data.Requests))
+	}
+	if got := s.openTicketOf("EQ-1"); got == nil || got.ID != "T0002" {
+		t.Fatalf("新工单 T0002 应仍为未关闭，得到 %v", got)
+	}
+
+	// 已关闭工单不能取消。
+	if _, _, err := s.closeTicket(tk2.ID, "已更换电源"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.cancelTicket(tk2.ID, "理由"); !errors.Is(err, errConflict) {
+		t.Fatalf("已关闭工单取消应失败，得到 %v", err)
+	}
+
+	// 履历：取消事件按序号排列，内容为取消理由。
+	events := s.eventsOf("EQ-1")
+	if len(events) != 4 {
+		t.Fatalf("履历条数 = %d，想得到 4", len(events))
+	}
+	if events[0].Kind != eventReport || events[0].TicketID != "T0001" ||
+		events[1].Kind != eventCancel || events[1].TicketID != "T0001" ||
+		events[1].Content != "误报，设备实际正常" ||
+		events[2].Kind != eventReport || events[2].TicketID != "T0002" ||
+		events[3].Kind != eventClose || events[3].TicketID != "T0002" {
+		t.Fatalf("履历顺序/内容不对: %+v", events)
+	}
+
+	// 重启后取消状态、理由、履历与去重结果保持。
+	s = saveAndReopen(t, s)
+	got := s.findTicket("T0001")
+	if got.Status != ticketCancelled || got.CancelReason != "误报，设备实际正常" ||
+		got.CancelledAt == "" {
+		t.Fatalf("重开后取消状态未保持: %+v", got)
+	}
+	old, replay, err = s.report("EQ-1", "卡纸", "req-1")
+	if err != nil || !replay || old.ID != "T0001" || old.Status != ticketCancelled {
+		t.Fatalf("重开后重放应返回已取消的 T0001: %v replay=%v err=%v", old, replay, err)
+	}
+	if len(s.eventsOf("EQ-1")) != 4 {
+		t.Fatal("重开后履历条数应保持")
+	}
+	if _, _, err := s.cancelTicket("T0001", "再次"); !errors.Is(err, errConflict) {
+		t.Fatalf("重开后重复取消应失败，得到 %v", err)
+	}
+}
+
 func TestHistoryOrder(t *testing.T) {
 	s := newTestStore(t)
 	_, _ = s.registerAsset("EQ-1", "打印机", "一楼")

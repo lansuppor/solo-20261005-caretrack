@@ -20,9 +20,11 @@ const (
 	statusRepairing = "维修中"
 	ticketOpen      = "未关闭"
 	ticketClosed    = "已关闭"
+	ticketCancelled = "已取消"
 
 	eventReport = "报修"
 	eventClose  = "关闭"
+	eventCancel = "取消"
 
 	storeVersion = 1
 	dataFileName = "caretrack.json"
@@ -43,17 +45,19 @@ type Asset struct {
 
 // Ticket 为维修工单。
 type Ticket struct {
-	ID          string `json:"id"`
-	AssetID     string `json:"asset_id"`
-	Description string `json:"description"`
-	RequestID   string `json:"request_id"`
-	Status      string `json:"status"`
-	Result      string `json:"result,omitempty"`
-	CreatedAt   string `json:"created_at"`
-	ClosedAt    string `json:"closed_at,omitempty"`
+	ID           string `json:"id"`
+	AssetID      string `json:"asset_id"`
+	Description  string `json:"description"`
+	RequestID    string `json:"request_id"`
+	Status       string `json:"status"`
+	Result       string `json:"result,omitempty"`
+	CreatedAt    string `json:"created_at"`
+	ClosedAt     string `json:"closed_at,omitempty"`
+	CancelReason string `json:"cancel_reason,omitempty"`
+	CancelledAt  string `json:"cancelled_at,omitempty"`
 }
 
-// Event 为履历条目（报修/关闭），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/关闭/取消），Seq 决定操作发生顺序。
 type Event struct {
 	Seq      int       `json:"-"`
 	AssetID  string    `json:"-"`
@@ -215,7 +219,7 @@ func validateData(d *storeData) error {
 		if n > maxTicketSeq {
 			maxTicketSeq = n
 		}
-		if t.Status != ticketOpen && t.Status != ticketClosed {
+		if t.Status != ticketOpen && t.Status != ticketClosed && t.Status != ticketCancelled {
 			return fmt.Errorf("状态矛盾：工单 %s 状态无效 %q", t.ID, t.Status)
 		}
 		if assets[t.AssetID] == nil {
@@ -224,8 +228,14 @@ func validateData(d *storeData) error {
 		if t.Status == ticketClosed && (t.Result == "" || t.ClosedAt == "") {
 			return fmt.Errorf("状态矛盾：已关闭工单 %s 缺少维修结果或关闭时间", t.ID)
 		}
-		if t.Status == ticketOpen && (t.Result != "" || t.ClosedAt != "") {
-			return fmt.Errorf("状态矛盾：未关闭工单 %s 不应带有维修结果或关闭时间", t.ID)
+		if t.Status == ticketCancelled && (t.CancelReason == "" || t.CancelledAt == "") {
+			return fmt.Errorf("状态矛盾：已取消工单 %s 缺少取消理由或取消时间", t.ID)
+		}
+		if t.Status != ticketClosed && (t.Result != "" || t.ClosedAt != "") {
+			return fmt.Errorf("状态矛盾：非已关闭工单 %s 不应带有维修结果或关闭时间", t.ID)
+		}
+		if t.Status != ticketCancelled && (t.CancelReason != "" || t.CancelledAt != "") {
+			return fmt.Errorf("状态矛盾：非已取消工单 %s 不应带有取消理由或取消时间", t.ID)
 		}
 		if tickets[t.ID] != nil {
 			return fmt.Errorf("数据矛盾：工单编号 %s 重复", t.ID)
@@ -292,8 +302,10 @@ func validateData(d *storeData) error {
 	seenSeq := map[int]bool{}
 	reportSeq := map[string]int{}
 	closeSeq := map[string]int{}
+	cancelSeq := map[string]int{}
 	reportCount := map[string]int{}
 	closeCount := map[string]int{}
+	cancelCount := map[string]int{}
 	for i := range d.Events {
 		e := &d.Events[i]
 		if e.Seq < 1 {
@@ -327,6 +339,12 @@ func validateData(d *storeData) error {
 			}
 			closeCount[t.ID]++
 			closeSeq[t.ID] = e.Seq
+		case eventCancel:
+			if e.Content != t.CancelReason {
+				return fmt.Errorf("履历矛盾：工单 %s 的取消履历内容与取消理由不一致", t.ID)
+			}
+			cancelCount[t.ID]++
+			cancelSeq[t.ID] = e.Seq
 		default:
 			return fmt.Errorf("履历矛盾：履历序号 %d 的事件类型无效 %q", e.Seq, e.Kind)
 		}
@@ -344,11 +362,22 @@ func validateData(d *storeData) error {
 					t.ID, closeSeq[t.ID], reportSeq[t.ID])
 			}
 		} else if closeCount[t.ID] != 0 {
-			return fmt.Errorf("履历矛盾：未关闭工单 %s 不得有关闭履历", t.ID)
+			return fmt.Errorf("履历矛盾：非已关闭工单 %s 不得有关闭履历", t.ID)
+		}
+		if t.Status == ticketCancelled {
+			if cancelCount[t.ID] != 1 {
+				return fmt.Errorf("履历矛盾：已取消工单 %s 应有恰一条取消履历，实际 %d 条", t.ID, cancelCount[t.ID])
+			}
+			if cancelSeq[t.ID] <= reportSeq[t.ID] {
+				return fmt.Errorf("履历矛盾：工单 %s 的取消履历（序号 %d）不在报修履历（序号 %d）之后",
+					t.ID, cancelSeq[t.ID], reportSeq[t.ID])
+			}
+		} else if cancelCount[t.ID] != 0 {
+			return fmt.Errorf("履历矛盾：非已取消工单 %s 不得有取消履历", t.ID)
 		}
 	}
 	// 按履历序号推进，重放得到的工单与资产状态须与保存的状态相符；
-	// 同一资产的上一张工单必须先关闭才可产生下一张报修。
+	// 同一资产的上一张工单必须先关闭或取消才可产生下一张报修。
 	sorted := make([]Event, len(d.Events))
 	copy(sorted, d.Events)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
@@ -361,7 +390,7 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：工单 %s 被重复报修", e.TicketID)
 			}
 			if prev := derivedOpen[e.AssetID]; prev != "" {
-				return fmt.Errorf("履历矛盾：资产 %s 的上一张工单 %s 尚未关闭就产生了工单 %s 的报修",
+				return fmt.Errorf("履历矛盾：资产 %s 的上一张工单 %s 尚未结束就产生了工单 %s 的报修",
 					e.AssetID, prev, e.TicketID)
 			}
 			derivedTicket[e.TicketID] = ticketOpen
@@ -371,6 +400,12 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现关闭履历", e.TicketID)
 			}
 			derivedTicket[e.TicketID] = ticketClosed
+			delete(derivedOpen, e.AssetID)
+		case eventCancel:
+			if derivedTicket[e.TicketID] != ticketOpen {
+				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现取消履历", e.TicketID)
+			}
+			derivedTicket[e.TicketID] = ticketCancelled
 			delete(derivedOpen, e.AssetID)
 		}
 	}
@@ -589,6 +624,9 @@ func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 	if t == nil {
 		return nil, nil, fmt.Errorf("%w: 未知工单编号 %q", errNotFound, ticketID)
 	}
+	if t.Status == ticketCancelled {
+		return nil, nil, fmt.Errorf("%w: 工单 %s 已取消，不能关闭", errConflict, ticketID)
+	}
 	if t.Status != ticketOpen {
 		return nil, nil, fmt.Errorf("%w: 工单 %s 已关闭，不能重复关闭", errConflict, ticketID)
 	}
@@ -605,5 +643,35 @@ func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 	t.ClosedAt = s.now().Format(time.RFC3339)
 	asset.Status = statusAvailable
 	s.appendEvent(eventSeq, asset.ID, t.ID, eventClose, result)
+	return t, asset, nil
+}
+
+// cancelTicket 取消未关闭工单并把资产恢复为可用。取消是终态，但不代表维修完成：
+// 不填写维修结果，不删除工单、履历或请求绑定，工单编号不回退也不复用。
+// 失败路径不修改任何业务数据。
+func (s *store) cancelTicket(ticketID, reason string) (*Ticket, *Asset, error) {
+	t := s.findTicket(ticketID)
+	if t == nil {
+		return nil, nil, fmt.Errorf("%w: 未知工单编号 %q", errNotFound, ticketID)
+	}
+	if t.Status == ticketCancelled {
+		return nil, nil, fmt.Errorf("%w: 工单 %s 已取消，不能再次取消", errConflict, ticketID)
+	}
+	if t.Status == ticketClosed {
+		return nil, nil, fmt.Errorf("%w: 工单 %s 已关闭，不能取消", errConflict, ticketID)
+	}
+	asset := s.findAsset(t.AssetID)
+	if asset == nil {
+		return nil, nil, fmt.Errorf("数据内部错误：工单 %s 引用的资产不存在", ticketID)
+	}
+	eventSeq, err := s.nextEventSeq()
+	if err != nil {
+		return nil, nil, err
+	}
+	t.Status = ticketCancelled
+	t.CancelReason = reason
+	t.CancelledAt = s.now().Format(time.RFC3339)
+	asset.Status = statusAvailable
+	s.appendEvent(eventSeq, asset.ID, t.ID, eventCancel, reason)
 	return t, asset, nil
 }

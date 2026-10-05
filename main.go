@@ -24,7 +24,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   detail     查看资产详情及其未关闭工单编号
   report     对资产报修，创建工单，资产转为“维修中”
   close      关闭工单并填写维修结果，设备恢复“可用”
-  history    按资产查看维修履历（报修、关闭事件）
+  cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
+  history    按资产查看维修履历（报修、关闭、取消事件）
   help       显示本帮助
 
 各命令参数:
@@ -34,6 +35,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   report   --asset-id 编号 --description 故障描述 --request-id 请求标识
                                                               [--data-dir 目录]
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
+  cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
 
 通用参数:
@@ -46,9 +48,13 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     报修失败，不改变状态与履历。
   - --request-id 由调用方提供且非空，仅用于同一数据目录内的报修去重，不作为
     资产或工单编号：相同标识、资产、描述再次提交返回原工单及当前状态，不新增
-    记录；同一标识搭配不同资产或描述将被拒绝；原工单关闭后重放仍返回原工单，
+    记录；同一标识搭配不同资产或描述将被拒绝；原工单关闭或取消后重放仍返回原工单，
     不重开旧单，也不影响新单。
   - 仅未关闭工单可关闭，维修结果不能为空；未知工单、重复关闭均失败。
+  - 仅未关闭工单可取消，取消理由不能为空；取消后工单进入“已取消”终态，保存取消
+    理由与时间，资产恢复“可用”，可再次报修。取消不代表维修完成，不填写维修结果，
+    不删除工单、履历或请求绑定，工单编号不回退也不复用；已取消工单不能关闭或再次
+    取消，已关闭工单也不能取消。
 
 无参数、--help、-h 显示本帮助；参数错误或业务失败以非零退出码结束并说明原因。
 `
@@ -92,6 +98,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdReport(args[1:], stdout)
 	case "close":
 		err = cmdClose(args[1:], stdout)
+	case "cancel":
+		err = cmdCancel(args[1:], stdout)
 	case "history":
 		err = cmdHistory(args[1:], stdout)
 	default:
@@ -322,6 +330,39 @@ func cmdClose(args []string, w io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(w, "工单 %s 已关闭。\n", ticket.ID)
+	fmt.Fprintf(w, "资产 %s 当前状态: %s\n", asset.ID, asset.Status)
+	return nil
+}
+
+func cmdCancel(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var ticketID, reason string
+	fs := newFlagSet("cancel", &opts)
+	fs.StringVar(&ticketID, "ticket-id", "", "要取消的工单编号（必填）")
+	fs.StringVar(&reason, "reason", "", "取消理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, ticketID, "ticket-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	ticket, asset, err := s.cancelTicket(ticketID, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "工单 %s 已取消。\n", ticket.ID)
+	fmt.Fprintf(w, "工单状态: %s\n", ticket.Status)
 	fmt.Fprintf(w, "资产 %s 当前状态: %s\n", asset.ID, asset.Status)
 	return nil
 }
