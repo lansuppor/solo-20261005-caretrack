@@ -23,9 +23,11 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   list       列出全部资产及当前状态
   detail     查看资产详情及其未关闭工单编号
   report     对资产报修，创建工单，资产转为“维修中”
+  assign     为未关闭工单派工或转派维修人员
+  ticket     按工单编号查询工单状态与负责人
   close      关闭工单并填写维修结果，设备恢复“可用”
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
-  history    按资产查看维修履历（报修、关闭、取消事件）
+  history    按资产查看维修履历（报修、派工、关闭、取消事件）
   help       显示本帮助
 
 各命令参数:
@@ -34,6 +36,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   detail   --asset-id 编号                                    [--data-dir 目录]
   report   --asset-id 编号 --description 故障描述 --request-id 请求标识
                                                               [--data-dir 目录]
+  assign   --ticket-id 工单编号 --assignee 维修人员 --note 说明  [--data-dir 目录]
+  ticket   --ticket-id 工单编号                                 [--data-dir 目录]
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
@@ -50,6 +54,13 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     资产或工单编号：相同标识、资产、描述再次提交返回原工单及当前状态，不新增
     记录；同一标识搭配不同资产或描述将被拒绝；原工单关闭或取消后重放仍返回原工单，
     不重开旧单，也不影响新单。
+  - 仅未关闭工单可派工：没有负责人时首次派工，已有负责人时转派给不同人员。
+    维修人员标识只是本地文本记录（非人员账户），与派工说明均不能为空；
+    成功后保存负责人、变更时间与说明，并追加一条含原负责人（首次派工为
+    “未派工”）、新负责人及说明的派工履历。派工不创建工单、不消耗工单编号，
+    不改变资产状态或报修请求绑定；未知工单、空人员或说明、重复派给当前
+    人员、对已关闭或已取消工单派工均失败且不产生履历。工单关闭或取消后
+    保留最后负责人与派工履历。
   - 仅未关闭工单可关闭，维修结果不能为空；未知工单、重复关闭均失败。
   - 仅未关闭工单可取消，取消理由不能为空；取消后工单进入“已取消”终态，保存取消
     理由与时间，资产恢复“可用”，可再次报修。取消不代表维修完成，不填写维修结果，
@@ -96,6 +107,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdDetail(args[1:], stdout)
 	case "report":
 		err = cmdReport(args[1:], stdout)
+	case "assign":
+		err = cmdAssign(args[1:], stdout)
+	case "ticket":
+		err = cmdTicket(args[1:], stdout)
 	case "close":
 		err = cmdClose(args[1:], stdout)
 	case "cancel":
@@ -256,8 +271,17 @@ func cmdDetail(args []string, w io.Writer) error {
 		fmt.Fprintln(w, "未关闭工单: 无")
 	} else {
 		fmt.Fprintf(w, "未关闭工单: %s\n", openTicket.ID)
+		fmt.Fprintf(w, "工单负责人: %s\n", assigneeDisplay(openTicket.Assignee))
 	}
 	return nil
+}
+
+// assigneeDisplay 把空负责人显示为“未派工”。
+func assigneeDisplay(assignee string) string {
+	if assignee == "" {
+		return "未派工"
+	}
+	return assignee
 }
 
 func cmdReport(args []string, w io.Writer) error {
@@ -299,6 +323,73 @@ func cmdReport(args []string, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "资产编号: %s\n", ticket.AssetID)
 	fmt.Fprintf(w, "工单状态: %s\n", ticket.Status)
+	return nil
+}
+
+func cmdAssign(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var ticketID, assignee, note string
+	fs := newFlagSet("assign", &opts)
+	fs.StringVar(&ticketID, "ticket-id", "", "要派工的工单编号（必填）")
+	fs.StringVar(&assignee, "assignee", "", "维修人员标识（必填，本地文本记录，非人员账户）")
+	fs.StringVar(&note, "note", "", "派工说明（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, ticketID, "ticket-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, assignee, "assignee"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, note, "note"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	ticket, err := s.assignTicket(ticketID, assignee, note)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "工单编号: %s\n", ticket.ID)
+	fmt.Fprintf(w, "负责人: %s\n", ticket.Assignee)
+	return nil
+}
+
+func cmdTicket(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var ticketID string
+	fs := newFlagSet("ticket", &opts)
+	fs.StringVar(&ticketID, "ticket-id", "", "要查询的工单编号（必填）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, ticketID, "ticket-id"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	t := s.findTicket(ticketID)
+	if t == nil {
+		return fmt.Errorf("未知工单编号 %q", ticketID)
+	}
+	fmt.Fprintf(w, "工单编号: %s\n", t.ID)
+	fmt.Fprintf(w, "资产编号: %s\n", t.AssetID)
+	fmt.Fprintf(w, "工单状态: %s\n", t.Status)
+	fmt.Fprintf(w, "负责人: %s\n", assigneeDisplay(t.Assignee))
+	if t.Assignee != "" {
+		fmt.Fprintf(w, "派工时间: %s\n", t.AssignedAt)
+		fmt.Fprintf(w, "派工说明: %s\n", t.AssignNote)
+	}
 	return nil
 }
 
@@ -392,6 +483,12 @@ func cmdHistory(args []string, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "资产 %s 维修履历（共 %d 条）:\n", id, len(events))
 	for _, e := range events {
+		if e.Kind == eventAssign {
+			fmt.Fprintf(w, "[%s] %s 工单 %s: %s -> %s（%s）\n",
+				e.Time.Format("2006-01-02T15:04:05Z07:00"), e.Kind, e.TicketID,
+				assigneeDisplay(e.From), e.To, e.Content)
+			continue
+		}
 		fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n",
 			e.Time.Format("2006-01-02T15:04:05Z07:00"), e.Kind, e.TicketID, e.Content)
 	}

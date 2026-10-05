@@ -46,7 +46,8 @@ caretrack list
 caretrack detail --asset-id EQ-001
 ```
 
-显示资产信息、当前状态，以及未关闭工单编号（无则显示“无”）。
+显示资产信息、当前状态，以及未关闭工单编号与其负责人（未派工时显示“未派工”；
+无未关闭工单时显示“无”）。
 
 ### 报修
 
@@ -64,6 +65,23 @@ caretrack report --asset-id EQ-001 --description 频繁卡纸 --request-id req-2
     也不影响之后的新工单。
 - 失败的新报修不会绑定请求标识；已有绑定保持不变。
 - 每项资产最多有一张未关闭工单。
+
+### 派工与转派
+
+```sh
+caretrack assign --ticket-id T0001 --assignee 张三 --note 首次派工，上门检修
+caretrack ticket --ticket-id T0001
+```
+
+- 仅未关闭工单可派工：没有负责人时首次派工，已有负责人时转派给不同人员。
+- 维修人员标识只是本地文本记录，不对应人员账户；标识与说明均不能为空。
+- 成功后输出工单编号与负责人，保存变更时间与说明，并追加一条含原负责人
+  （首次派工为“未派工”）、新负责人及说明的派工履历。
+- 派工不创建工单、不消耗工单编号，不改变资产状态或报修请求绑定。
+- 未知工单、空人员或说明、重复派给当前人员、对已关闭或已取消工单派工
+  均被拒绝且不产生履历。
+- 工单关闭或取消后保留最后负责人与派工履历；`ticket` 查询显示未派工或
+  当前、最终负责人及工单状态。
 
 ### 关闭工单
 
@@ -93,8 +111,9 @@ caretrack cancel --ticket-id T0001 --reason 误报，设备实际正常
 caretrack history --asset-id EQ-001
 ```
 
-按操作发生顺序展示该资产的报修、关闭、取消事件，包含所属工单编号、时间和内容
-（取消事件展示取消理由）；失败操作不产生履历。无履历时明确提示。
+按操作发生顺序展示该资产的报修、派工、关闭、取消事件，包含所属工单编号、
+时间和内容（派工事件展示原负责人、新负责人与说明；取消事件展示取消理由）；
+失败操作不产生履历。无履历时明确提示。
 
 ## 完整示例
 
@@ -102,6 +121,9 @@ caretrack history --asset-id EQ-001
 D=/tmp/caretrack-data
 caretrack register --data-dir $D --asset-id EQ-001 --name 打印机 --location 一楼大厅
 caretrack report   --data-dir $D --asset-id EQ-001 --description 频繁卡纸 --request-id req-1
+caretrack assign   --data-dir $D --ticket-id T0001 --assignee 张三 --note 首次派工
+caretrack assign   --data-dir $D --ticket-id T0001 --assignee 李四 --note 张三请假，转派
+caretrack ticket   --data-dir $D --ticket-id T0001
 caretrack detail   --data-dir $D --asset-id EQ-001
 caretrack cancel   --data-dir $D --ticket-id T0001 --reason 误报，设备实际正常
 caretrack report   --data-dir $D --asset-id EQ-001 --description 无法开机 --request-id req-2
