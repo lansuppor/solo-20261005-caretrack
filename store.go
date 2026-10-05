@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -155,6 +158,9 @@ func openStore(dir string) (*store, error) {
 		}
 		d.Events[i] = ev
 	}
+	if err := validateConsistency(&d); err != nil {
+		return nil, fmt.Errorf("数据文件 %s 内容矛盾：%w（原文件已保留，未做任何修改）", path, err)
+	}
 	return &store{dir: dir, data: &d, now: time.Now}, nil
 }
 
@@ -180,7 +186,7 @@ func validateData(d *storeData) error {
 	}
 	seenTickets := map[string]bool{}
 	for _, t := range d.Tickets {
-		if t == nil || t.ID == "" || t.AssetID == "" || t.RequestID == "" || t.CreatedAt == "" {
+		if t == nil || t.ID == "" || t.AssetID == "" || t.Description == "" || t.RequestID == "" || t.CreatedAt == "" {
 			return errors.New("存在字段不完整的工单记录")
 		}
 		if t.Status != ticketOpen && t.Status != ticketClosed {
@@ -189,8 +195,16 @@ func validateData(d *storeData) error {
 		if !seenAssets[t.AssetID] {
 			return fmt.Errorf("工单 %s 引用了不存在的资产", t.ID)
 		}
-		if t.Status == ticketClosed && (t.Result == "" || t.ClosedAt == "") {
-			return fmt.Errorf("工单 %s 缺少关闭信息", t.ID)
+		if _, err := time.Parse(time.RFC3339, t.CreatedAt); err != nil {
+			return fmt.Errorf("工单 %s 的创建时间格式无效", t.ID)
+		}
+		if t.Status == ticketClosed {
+			if t.Result == "" || t.ClosedAt == "" {
+				return fmt.Errorf("工单 %s 缺少关闭信息", t.ID)
+			}
+			if _, err := time.Parse(time.RFC3339, t.ClosedAt); err != nil {
+				return fmt.Errorf("工单 %s 的关闭时间格式无效", t.ID)
+			}
 		}
 		if seenTickets[t.ID] {
 			return fmt.Errorf("工单编号 %s 重复", t.ID)
@@ -224,12 +238,178 @@ func validateData(d *storeData) error {
 	return nil
 }
 
+// formatTicketID 生成工单编号：T 加补零正整数序号（至少 4 位）。
+func formatTicketID(seq int) string {
+	return fmt.Sprintf("T%04d", seq)
+}
+
+// parseTicketSeq 解析工单编号，仅接受 formatTicketID 的规范形式。
+func parseTicketSeq(id string) (int, bool) {
+	if !strings.HasPrefix(id, "T") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(id[1:])
+	if err != nil || n < 1 || formatTicketID(n) != id {
+		return 0, false
+	}
+	return n, true
+}
+
+// validateConsistency 校验整份业务数据的内部一致性，发现矛盾时返回以
+// “计数器矛盾 / 请求绑定矛盾 / 状态矛盾 / 履历矛盾”开头的错误。
+// 调用前须先通过 validateData 的结构校验；本函数只报告矛盾，不修改任何数据。
+func validateConsistency(d *storeData) error {
+	ticketsByID := map[string]*Ticket{}
+	maxUsed := 0
+	for _, t := range d.Tickets {
+		n, ok := parseTicketSeq(t.ID)
+		if !ok {
+			return fmt.Errorf("计数器矛盾：工单编号 %q 不是 T 加补零正整数序号的形式", t.ID)
+		}
+		ticketsByID[t.ID] = t
+		if n > maxUsed {
+			maxUsed = n
+		}
+	}
+	if d.NextTicketSeq < 1 || d.NextTicketSeq <= maxUsed {
+		return fmt.Errorf("计数器矛盾：下一工单序号 %d 必须为正并大于全部已用序号（当前最大已用 %d）",
+			d.NextTicketSeq, maxUsed)
+	}
+
+	// 每张工单恰有一条请求绑定，且绑定内容与工单完全一致。
+	bindingsOf := map[string]int{}
+	for _, r := range d.Requests {
+		t := ticketsByID[r.TicketID]
+		if t == nil {
+			continue // 结构校验已报告
+		}
+		bindingsOf[r.TicketID]++
+		if r.RequestID != t.RequestID || r.AssetID != t.AssetID || r.Description != t.Description {
+			return fmt.Errorf("请求绑定矛盾：请求标识 %q 的绑定与工单 %s 的请求标识、资产编号或故障描述不一致",
+				r.RequestID, t.ID)
+		}
+	}
+	for _, t := range d.Tickets {
+		switch bindingsOf[t.ID] {
+		case 0:
+			return fmt.Errorf("请求绑定矛盾：工单 %s 缺少对应的报修请求绑定", t.ID)
+		case 1:
+		default:
+			return fmt.Errorf("请求绑定矛盾：工单 %s 对应多条报修请求绑定", t.ID)
+		}
+	}
+
+	// 每项资产最多一张未关闭工单；有未关闭工单时必须“维修中”，否则必须“可用”。
+	openByAsset := map[string]string{}
+	for _, t := range d.Tickets {
+		if t.Status != ticketOpen {
+			continue
+		}
+		if t.Result != "" || t.ClosedAt != "" {
+			return fmt.Errorf("状态矛盾：未关闭工单 %s 不应带有维修结果或关闭时间", t.ID)
+		}
+		if prev, ok := openByAsset[t.AssetID]; ok {
+			return fmt.Errorf("状态矛盾：资产 %s 同时存在多张未关闭工单（%s、%s）", t.AssetID, prev, t.ID)
+		}
+		openByAsset[t.AssetID] = t.ID
+	}
+	for _, a := range d.Assets {
+		if _, hasOpen := openByAsset[a.ID]; hasOpen {
+			if a.Status != statusRepairing {
+				return fmt.Errorf("状态矛盾：资产 %s 有未关闭工单，状态应为“维修中”而非 %q", a.ID, a.Status)
+			}
+		} else if a.Status != statusAvailable {
+			return fmt.Errorf("状态矛盾：资产 %s 没有未关闭工单，状态应为“可用”而非 %q", a.ID, a.Status)
+		}
+	}
+
+	// 履历：序号全库唯一且为正；按序号推进重放，校验与工单、资产状态相符。
+	events := make([]eventJSON, len(d.EventsJSON))
+	copy(events, d.EventsJSON)
+	sort.SliceStable(events, func(i, j int) bool { return events[i].Seq < events[j].Seq })
+	seenSeq := map[int]bool{}
+	reportCount := map[string]int{}
+	closeCount := map[string]int{}
+	openByReplay := map[string]string{}
+	for _, e := range events {
+		if e.Seq < 1 {
+			return fmt.Errorf("履历矛盾：履历序号 %d 不是正整数", e.Seq)
+		}
+		if seenSeq[e.Seq] {
+			return fmt.Errorf("履历矛盾：履历序号 %d 重复", e.Seq)
+		}
+		seenSeq[e.Seq] = true
+		t := ticketsByID[e.TicketID]
+		if t == nil {
+			continue // 结构校验已报告
+		}
+		if e.AssetID != t.AssetID {
+			return fmt.Errorf("履历矛盾：序号 %d 履历的资产 %s 与工单 %s 所属资产 %s 不一致",
+				e.Seq, e.AssetID, t.ID, t.AssetID)
+		}
+		switch e.Kind {
+		case eventReport:
+			reportCount[t.ID]++
+			if e.Content != t.Description {
+				return fmt.Errorf("履历矛盾：工单 %s 的报修履历内容与故障描述不一致", t.ID)
+			}
+			if prev, ok := openByReplay[t.AssetID]; ok {
+				if prev == t.ID {
+					return fmt.Errorf("履历矛盾：工单 %s 的报修履历重复", t.ID)
+				}
+				return fmt.Errorf("履历矛盾：资产 %s 的上一张工单 %s 尚未关闭，就产生了工单 %s 的报修",
+					t.AssetID, prev, t.ID)
+			}
+			openByReplay[t.AssetID] = t.ID
+		case eventClose:
+			closeCount[t.ID]++
+			if t.Status != ticketClosed {
+				return fmt.Errorf("履历矛盾：未关闭工单 %s 不应有关闭履历", t.ID)
+			}
+			if e.Content != t.Result {
+				return fmt.Errorf("履历矛盾：工单 %s 的关闭履历内容与维修结果不一致", t.ID)
+			}
+			if openByReplay[t.AssetID] != t.ID {
+				return fmt.Errorf("履历矛盾：工单 %s 的关闭履历出现在其报修之前", t.ID)
+			}
+			delete(openByReplay, t.AssetID)
+		}
+	}
+	for _, t := range d.Tickets {
+		if reportCount[t.ID] != 1 {
+			return fmt.Errorf("履历矛盾：工单 %s 应恰有一条报修履历，实际 %d 条", t.ID, reportCount[t.ID])
+		}
+		if t.Status == ticketClosed && closeCount[t.ID] != 1 {
+			return fmt.Errorf("履历矛盾：已关闭工单 %s 应恰有一条关闭履历，实际 %d 条", t.ID, closeCount[t.ID])
+		}
+	}
+	// 按履历推进得到的未关闭工单须与保存的工单、资产状态相符。
+	for assetID, tid := range openByReplay {
+		if openByAsset[assetID] != tid {
+			return fmt.Errorf("状态矛盾：按履历推进资产 %s 的未关闭工单为 %s，与保存的状态不符", assetID, tid)
+		}
+	}
+	for assetID, tid := range openByAsset {
+		if openByReplay[assetID] != tid {
+			return fmt.Errorf("状态矛盾：保存的未关闭工单 %s 与资产 %s 的履历推进结果不符", tid, assetID)
+		}
+	}
+	return nil
+}
+
 // save 将全部业务数据一次性原子写入：先写同目录临时文件，fsync 后 rename
-// 覆盖正式文件。业务校验均在调用 save 之前完成；写入失败时原文件保持不变。
+// 覆盖正式文件。写入前先校验待提交数据的一致性；校验或读写失败时原文件
+// 保持不变，不留下部分业务变化。
 func (s *store) save() error {
 	s.data.EventsJSON = make([]eventJSON, len(s.data.Events))
 	for i, e := range s.data.Events {
 		s.data.EventsJSON[i] = e.toJSON()
+	}
+	if err := validateData(s.data); err != nil {
+		return fmt.Errorf("待保存数据未通过校验（%w），本次写入已放弃，原数据文件保持不变", err)
+	}
+	if err := validateConsistency(s.data); err != nil {
+		return fmt.Errorf("待保存数据未通过一致性校验（%w），本次写入已放弃，原数据文件保持不变", err)
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -374,9 +554,12 @@ func (s *store) report(assetID, description, requestID string) (*Ticket, bool, e
 	}
 
 	seq := s.data.NextTicketSeq
+	if seq >= math.MaxInt {
+		return nil, false, fmt.Errorf("%w: 工单编号已耗尽，无法接受新报修（已有工单仍可查询和关闭）", errConflict)
+	}
 	s.data.NextTicketSeq++
 	t := &Ticket{
-		ID:          fmt.Sprintf("T%04d", seq),
+		ID:          formatTicketID(seq),
 		AssetID:     assetID,
 		Description: description,
 		RequestID:   requestID,
