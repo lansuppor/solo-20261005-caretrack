@@ -91,7 +91,9 @@ func (e Event) toJSON() eventJSON {
 	return eventJSON{
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
-		Time: e.Time.Format(time.RFC3339),
+		// RFC3339Nano 保留小数秒精度（整秒时输出与 RFC3339 相同）：
+		// 履历时间必须保留原瞬间，不能被低精度格式截断。
+		Time: e.Time.Format(time.RFC3339Nano),
 	}
 }
 
