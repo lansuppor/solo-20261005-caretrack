@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 const appName = "caretrack"
@@ -28,6 +29,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   close      关闭工单并填写维修结果，设备恢复“可用”
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
   history    按资产查看维修履历（报修、派工、关闭、取消事件）
+  downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
   help       显示本帮助
 
 各命令参数:
@@ -41,6 +43,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
+  downtime --start 起点 --end 终点 [--asset-id 编号]          [--data-dir 目录]
 
 通用参数:
   --data-dir 目录   本地数据目录，默认 ".caretrack"；不同目录数据互不影响，
@@ -66,8 +69,19 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     理由与时间，资产恢复“可用”，可再次报修。取消不代表维修完成，不填写维修结果，
     不删除工单、履历或请求绑定，工单编号不回退也不复用；已取消工单不能关闭或再次
     取消，已关闭工单也不能取消。
+  - downtime 为只读统计，不写文件、不初始化目录、不追加履历。--start/--end 为
+    带时区的 RFC3339 时刻（可含小数秒），起点须早于终点；窗口包含起点、不包含
+    终点，按实际时刻比较。停机自工单报修履历时间起，至关闭或取消履历时间止
+    （取消前的占用同样计入）；派工、转派不另起区间；未关闭工单暂算到窗口终点，
+    不读取运行时刻，也不改变状态。只统计工单区间与窗口的交集，窗口外及零长度
+    不贡献；同一资产多张工单的重叠交集取并集，不直接相加。每项资产合计后向下
+    取整为秒，并输出全部所选资产秒数之和；没有停机的资产显示零。不给 --asset-id
+    时统计全部资产并按编号字典序排列，空库明确提示无记录并显示零合计。若所选
+    资产任一终结工单的结束履历时间早于报修履历时间（即使该单在窗口外、结束
+    等于开始合法），整次统计失败，指出资产与工单，不输出部分结果。
 
 无参数、--help、-h 显示本帮助；参数错误或业务失败以非零退出码结束并说明原因。
+参数错误退出码为 2；未知资产、上述时间异常及数据读取失败退出码为 1。
 `
 
 type cmdOptions struct {
@@ -117,6 +131,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdCancel(args[1:], stdout)
 	case "history":
 		err = cmdHistory(args[1:], stdout)
+	case "downtime":
+		err = cmdDowntime(args[1:], stdout)
 	default:
 		fmt.Fprintf(stderr, "%s: 未知命令 %q，使用 --help 查看帮助\n", appName, args[0])
 		return 2
@@ -492,5 +508,81 @@ func cmdHistory(args []string, w io.Writer) error {
 		fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n",
 			e.Time.Format("2006-01-02T15:04:05Z07:00"), e.Kind, e.TicketID, e.Content)
 	}
+	return nil
+}
+
+// cmdDowntime 为只读的停机时长统计：先经 openStore 完成整库一致性检查，
+// 再计算窗口内的停机秒数。无论成功或失败都不保存，因此不写文件、不初始化
+// 目录、不追加履历、不消耗编号，也不改变报修请求绑定。
+func cmdDowntime(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var startText, endText, assetID string
+	fs := newFlagSet("downtime", &opts)
+	fs.StringVar(&startText, "start", "", "窗口起点（必填，带时区的 RFC3339 时刻，可含小数秒；包含）")
+	fs.StringVar(&endText, "end", "", "窗口终点（必填，带时区的 RFC3339 时刻，可含小数秒；不包含）")
+	fs.StringVar(&assetID, "asset-id", "", "企业资产编号（可选；缺省统计全部资产）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, startText, "start"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, endText, "end"); err != nil {
+		return err
+	}
+	start, err := time.Parse(time.RFC3339, startText)
+	if err != nil {
+		return &usageError{msg: fmt.Sprintf("--start 不是带时区的 RFC3339 时刻 %q: %s", startText, err)}
+	}
+	end, err := time.Parse(time.RFC3339, endText)
+	if err != nil {
+		return &usageError{msg: fmt.Sprintf("--end 不是带时区的 RFC3339 时刻 %q: %s", endText, err)}
+	}
+	if !start.Before(end) {
+		return &usageError{msg: fmt.Sprintf("--start（%s）须早于 --end（%s）", startText, endText)}
+	}
+
+	// openStore 已先做整库一致性检查：损坏或关联矛盾按原规则拒绝（退出码 1）。
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+
+	var ids []string
+	if assetID != "" {
+		// 未知资产在统计前拒绝（退出码 1）。
+		if s.findAsset(assetID) == nil {
+			return fmt.Errorf("未知资产编号 %q", assetID)
+		}
+		ids = []string{assetID}
+	} else {
+		ids = s.allAssetIDs()
+		if len(ids) == 0 {
+			fmt.Fprintln(w, "没有记录。")
+			fmt.Fprintln(w, "合计: 0 秒")
+			return nil
+		}
+	}
+
+	// 先算完全部结果再输出：任一资产存在时间异常时整体失败，不输出部分结果。
+	results, err := s.downtimeForAssets(ids, start, end)
+	if err != nil {
+		return err
+	}
+	var total int64
+	if len(results) == 1 {
+		r := results[0]
+		fmt.Fprintf(w, "资产编号: %s\n", r.AssetID)
+		fmt.Fprintf(w, "名称: %s\n", r.Name)
+		fmt.Fprintf(w, "停机秒数: %d\n", r.Seconds)
+		total = r.Seconds
+	} else {
+		fmt.Fprintf(w, "共 %d 项资产:\n", len(results))
+		for _, r := range results {
+			fmt.Fprintf(w, "%s\t%s\t%d\n", r.AssetID, r.Name, r.Seconds)
+			total += r.Seconds
+		}
+	}
+	fmt.Fprintf(w, "合计: %d 秒\n", total)
 	return nil
 }
