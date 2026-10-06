@@ -12,12 +12,16 @@ import (
 )
 
 // 资产批量导入：把源数据目录中所选资产连同其全部工单、报修请求绑定、
-// 报修/派工/关闭/取消履历与保养计划（含保养建立/完成履历）复制到目标数据目录。
+// 报修/派工/关闭/取消履历、备件领用记录（含领用/退回履历）与保养计划
+// （含保养建立/完成履历）复制到目标数据目录。
 //
 // 关键规则：
 //   - 导入是复制：源台账始终只读，不删除、不修改任何源记录；同一台账不能导入自身。
 //   - 工单编号按源工单序号升序，从目标的下一工单序号重新分配，并同步替换履历与
 //     请求绑定中的工单引用；目标原有记录不改编号、不改变业务含义。
+//   - 备件领用编号按源领用顺序，从目标的下一领用序号重新分配并输出映射，退回
+//     履历中的领用引用同步替换；备件、数量、说明与履历时间（含小数秒）原样保留，
+//     导入的未关闭工单可继续退回。
 //   - 履历按源履历序号排列，在目标已有最大履历序号之后依次分配新序号，保留原操作
 //     顺序（不按时间重排）；履历时间保留原瞬间与小数秒精度。导入本身不追加报修
 //     或其他业务事件。
@@ -44,10 +48,17 @@ type ticketRemap struct {
 	NewID string
 }
 
+// issueRemap 记录一笔备件领用的原编号与新编号。
+type issueRemap struct {
+	OldID string
+	NewID string
+}
+
 // importOutcome 为一次成功导入的结果摘要，用于输出。
 type importOutcome struct {
 	assetIDs []string
 	tickets  []ticketRemap
+	issues   []issueRemap
 	plans    int
 }
 
@@ -88,6 +99,12 @@ func cmdImport(args []string, w io.Writer) error {
 	fmt.Fprintln(w, "工单编号映射（原编号 -> 新编号）:")
 	for _, m := range outcome.tickets {
 		fmt.Fprintf(w, "%s -> %s\n", m.OldID, m.NewID)
+	}
+	if len(outcome.issues) > 0 {
+		fmt.Fprintln(w, "领用编号映射（原编号 -> 新编号）:")
+		for _, m := range outcome.issues {
+			fmt.Fprintf(w, "%s -> %s\n", m.OldID, m.NewID)
+		}
 	}
 	return nil
 }
@@ -179,6 +196,25 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 			"%w: 目标工单编号容量不足：下一序号 %d 无法容纳 %d 张导入工单，整批拒绝导入",
 			errConflict, s.data.NextTicketSeq, len(tickets))
 	}
+	// 所选资产工单的全部备件领用记录，按源领用编号序号升序（即源领用顺序）
+	// 重新分配编号。
+	srcIssues := make([]*PartIssue, 0)
+	for _, pi := range src.data.PartIssues {
+		if selected[pi.AssetID] {
+			srcIssues = append(srcIssues, pi)
+		}
+	}
+	sort.SliceStable(srcIssues, func(i, j int) bool {
+		ni, _ := parseIssueSeq(srcIssues[i].ID)
+		nj, _ := parseIssueSeq(srcIssues[j].ID)
+		return ni < nj
+	})
+	// 领用编号容量：与 issuePart 同一约束，可分配的最大序号为 math.MaxInt-1。
+	if len(srcIssues) > math.MaxInt-s.data.NextIssueSeq {
+		return nil, fmt.Errorf(
+			"%w: 目标领用编号容量不足：下一序号 %d 无法容纳 %d 笔导入领用，整批拒绝导入",
+			errConflict, s.data.NextIssueSeq, len(srcIssues))
+	}
 	// 所选工单的任一请求标识已在目标绑定时整批拒绝，不改请求标识。
 	srcReqByTicket := map[string]*requestBinding{}
 	for i := range src.data.Requests {
@@ -251,12 +287,27 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		next++
 	}
 	s.data.NextTicketSeq = next
+	// 备件领用记录随工单一并复制：领用编号从目标下一领用序号重新分配，
+	// 工单引用同步替换；备件、数量与说明原样保留。
+	remapIssue := map[string]string{}
+	nextIssue := s.data.NextIssueSeq
+	for _, pi := range srcIssues {
+		np := *pi
+		np.ID = fmt.Sprintf("P%04d", nextIssue)
+		np.TicketID = remap[pi.TicketID]
+		remapIssue[pi.ID] = np.ID
+		s.data.PartIssues = append(s.data.PartIssues, &np)
+		outcome.issues = append(outcome.issues, issueRemap{OldID: pi.ID, NewID: np.ID})
+		nextIssue++
+	}
+	s.data.NextIssueSeq = nextIssue
 	seq := maxSeq
 	for _, e := range events {
 		seq++
 		ne := e
 		ne.Seq = seq
 		ne.TicketID = remap[e.TicketID]
+		ne.IssueID = remapIssue[e.IssueID]
 		s.data.Events = append(s.data.Events, ne)
 	}
 	return outcome, nil

@@ -25,15 +25,17 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   detail     查看资产详情及其未关闭工单编号、保养计划
   report     对资产报修，创建工单，资产转为“维修中”
   assign     为未关闭工单派工或转派维修人员
-  ticket     按工单编号查询工单状态与负责人
+  ticket     按工单编号查询工单状态、负责人及备件领用与净量
   close      关闭工单并填写维修结果，设备恢复“可用”
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
+  issue      为未关闭工单领用备件，生成唯一领用编号
+  return     按领用编号退回备件（允许多次部分退回，累计不超过原数量）
   plan       为资产建立唯一的周期保养计划（不可覆盖）
   maintain   登记当前周期的保养完成，推进下一到期日
   due        按指定日期列出到期的保养计划（只读）
-  history    按资产查看履历（报修、派工、关闭、取消、保养建立与完成事件）
+  history    按资产查看履历（报修、派工、关闭、取消、保养建立与完成、备件领用与退回事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
-  import     从另一数据目录批量导入资产及其工单、履历、请求绑定与保养计划（复制，源只读）
+  import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划与备件记录（复制，源只读）
   help       显示本帮助
 
 各命令参数:
@@ -46,6 +48,9 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   ticket   --ticket-id 工单编号                                 [--data-dir 目录]
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
+  issue    --ticket-id 工单编号 --part-no 备件编号 --qty 数量 --note 说明
+                                                              [--data-dir 目录]
+  return   --issue-id 领用编号 --qty 数量 --reason 理由        [--data-dir 目录]
   plan     --asset-id 编号 --content 保养内容 --first-due 首次到期日
            --interval-days 间隔天数                           [--data-dir 目录]
   maintain --asset-id 编号 --due 周期到期日 --done 实际完成日 --result 结果
@@ -80,6 +85,17 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     理由与时间，资产恢复“可用”，可再次报修。取消不代表维修完成，不填写维修结果，
     不删除工单、履历或请求绑定，工单编号不回退也不复用；已取消工单不能关闭或再次
     取消，已关闭工单也不能取消。
+  - 备件领用：仅未关闭工单可领用；工单编号、非空备件编号、正整数数量与非空说明
+    缺一不可。每次成功生成同目录唯一且不复用的领用编号（形如 P0001）并输出；
+    同一备件多次领用各自独立，领用编号用于定位记录，不用报修请求标识代替。
+    退回按领用编号定位，作用于其所属工单：数量为正整数、理由非空，允许多次
+    部分退回，累计不得超过该笔原数量，不能冲减另一笔；成功显示累计退回与净量
+    （原数量减累计退回）。未知领用编号、超额退回均被拒绝。工单关闭或取消后
+    保留领用记录与净量，不自动清零，但终结后拒绝再领用、再退回；旧单的领用
+    记录不影响同一资产之后的新工单。ticket 查询按领用顺序显示各笔编号、备件、
+    原数量、累计退回与净量，并按备件编号字典序汇总净量（零值仍显示，无记录
+    明确提示）；history 按履历序号展示领用、退回的时间、工单、领用编号、备件、
+    数量及说明或理由。领用与退回各为一次原子保存。
   - 每项资产最多一个周期保养计划，建立后不可覆盖：保养内容非空，首次到期日为
     0001 至 9999 年的有效公历日期（YYYY-MM-DD），间隔天数为正整数；日期按日历日
     运算，不受时区与运行时刻影响。未知资产或已有计划时拒绝。资产详情显示保养
@@ -107,11 +123,13 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     时统计全部资产并按编号字典序排列，空库明确提示无记录并显示零合计。若所选
     资产任一终结工单的结束履历时间早于报修履历时间（即使该单在窗口外、结束
     等于开始合法），整次统计失败，指出资产与工单，不输出部分结果。
-  - import 把源数据目录中所选资产连同全部工单、报修请求绑定、履历与保养计划
-    复制到目标目录（--data-dir）：源台账始终只读，同一台账不能导入自身；重复编号
-    按一项处理。工单编号按源工单序号升序从目标下一序号重新分配，履历与请求绑定
-    中的工单引用同步替换；履历在目标最大履历序号之后按源序号顺序分配新序号，保留
-    原操作顺序与原时间（含小数秒）。保养计划与保养履历原样复制，内容、日期及完成
+  - import 把源数据目录中所选资产连同全部工单、报修请求绑定、履历、保养计划
+    与备件领用记录复制到目标目录（--data-dir）：源台账始终只读，同一台账不能
+    导入自身；重复编号按一项处理。工单编号按源工单序号升序从目标下一序号重新
+    分配，履历与请求绑定中的工单引用同步替换；备件领用编号按源领用顺序从目标
+    下一领用序号重新分配并输出映射，退回履历的领用引用同步更新，数量、时间
+    精度与操作顺序保持，导入的未关闭工单可继续退回。履历在目标最大履历序号
+    之后按源序号顺序分配新序号，保留原操作顺序与原时间（含小数秒）。保养计划与保养履历原样复制，内容、日期及完成
     链接续，目标已有计划不变。资产编号在目标已存在、或所选工单的任一请求标识已在
     目标绑定时整批拒绝，不覆盖、不合并。导入后可用原请求标识、资产与描述重放报修，
     返回映射后的工单及其当前状态；再次导入同一批资产按编号冲突拒绝。任何失败
@@ -167,6 +185,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdClose(args[1:], stdout)
 	case "cancel":
 		err = cmdCancel(args[1:], stdout)
+	case "issue":
+		err = cmdIssue(args[1:], stdout)
+	case "return":
+		err = cmdReturn(args[1:], stdout)
 	case "plan":
 		err = cmdPlan(args[1:], stdout)
 	case "maintain":
@@ -460,6 +482,21 @@ func cmdTicket(args []string, w io.Writer) error {
 		fmt.Fprintf(w, "派工时间: %s\n", t.AssignedAt)
 		fmt.Fprintf(w, "派工说明: %s\n", t.AssignNote)
 	}
+	// 备件台账：按领用顺序列出各笔，并按备件编号字典序汇总净量（零值仍显示）。
+	rows := s.partIssuesOf(ticketID)
+	if len(rows) == 0 {
+		fmt.Fprintln(w, "备件领用: 无")
+		return nil
+	}
+	fmt.Fprintf(w, "备件领用（共 %d 笔）:\n", len(rows))
+	for _, r := range rows {
+		fmt.Fprintf(w, "%s\t%s\t原数量 %d\t累计退回 %d\t净量 %d\n",
+			r.ID, r.PartNo, r.Qty, r.Returned, r.Net)
+	}
+	fmt.Fprintln(w, "按备件汇总净量:")
+	for _, sn := range summarizePartNet(rows) {
+		fmt.Fprintf(w, "%s\t净量 %d\n", sn.PartNo, sn.Net)
+	}
 	return nil
 }
 
@@ -525,6 +562,93 @@ func cmdCancel(args []string, w io.Writer) error {
 	fmt.Fprintf(w, "工单 %s 已取消。\n", ticket.ID)
 	fmt.Fprintf(w, "工单状态: %s\n", ticket.Status)
 	fmt.Fprintf(w, "资产 %s 当前状态: %s\n", asset.ID, asset.Status)
+	return nil
+}
+
+// cmdIssue 为未关闭工单领用备件：生成唯一领用编号并输出，一次原子保存。
+func cmdIssue(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var ticketID, partNo, note string
+	var qty int
+	fs := newFlagSet("issue", &opts)
+	fs.StringVar(&ticketID, "ticket-id", "", "要领用备件的工单编号（必填，仅未关闭工单）")
+	fs.StringVar(&partNo, "part-no", "", "备件编号（必填，非空）")
+	fs.IntVar(&qty, "qty", 0, "领用数量（必填，正整数）")
+	fs.StringVar(&note, "note", "", "领用说明（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, ticketID, "ticket-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, partNo, "part-no"); err != nil {
+		return err
+	}
+	if qty < 1 {
+		return &usageError{msg: "--qty 须为正整数"}
+	}
+	if err := requireFlag(fs, note, "note"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	pi, err := s.issuePart(ticketID, partNo, qty, note)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "领用编号: %s\n", pi.ID)
+	fmt.Fprintf(w, "工单编号: %s\n", pi.TicketID)
+	fmt.Fprintf(w, "备件编号: %s\n", pi.PartNo)
+	fmt.Fprintf(w, "领用数量: %d\n", pi.Qty)
+	return nil
+}
+
+// cmdReturn 按领用编号退回备件：作用于该笔所属工单，允许多次部分退回，
+// 累计不得超过该笔原数量。成功显示累计退回与净量，一次原子保存。
+func cmdReturn(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var issueID, reason string
+	var qty int
+	fs := newFlagSet("return", &opts)
+	fs.StringVar(&issueID, "issue-id", "", "要退回的领用编号（必填）")
+	fs.IntVar(&qty, "qty", 0, "退回数量（必填，正整数）")
+	fs.StringVar(&reason, "reason", "", "退回理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, issueID, "issue-id"); err != nil {
+		return err
+	}
+	if qty < 1 {
+		return &usageError{msg: "--qty 须为正整数"}
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	pi, returned, err := s.returnPart(issueID, qty, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "领用编号: %s\n", pi.ID)
+	fmt.Fprintf(w, "工单编号: %s\n", pi.TicketID)
+	fmt.Fprintf(w, "备件编号: %s\n", pi.PartNo)
+	fmt.Fprintf(w, "原数量: %d\n", pi.Qty)
+	fmt.Fprintf(w, "累计退回: %d\n", returned)
+	fmt.Fprintf(w, "净量: %d\n", pi.Qty-returned)
 	return nil
 }
 
@@ -693,6 +817,9 @@ func cmdHistory(args []string, w io.Writer) error {
 		case eventPlanDone:
 			fmt.Fprintf(w, "[%s] %s: 周期到期日 %s，实际完成日 %s，%s\n",
 				ts, e.Kind, e.Due, e.Done, e.Content)
+		case eventPartIssue, eventPartReturn:
+			fmt.Fprintf(w, "[%s] %s 工单 %s 领用编号 %s: 备件 %s，数量 %d，%s\n",
+				ts, e.Kind, e.TicketID, e.IssueID, e.PartNo, e.Qty, e.Content)
 		default:
 			fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n", ts, e.Kind, e.TicketID, e.Content)
 		}
