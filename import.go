@@ -11,8 +11,8 @@ import (
 	"strings"
 )
 
-// 资产批量导入：把源数据目录中所选资产连同其全部工单、报修请求绑定与
-// 报修/派工/关闭/取消履历复制到目标数据目录。
+// 资产批量导入：把源数据目录中所选资产连同其全部工单、报修请求绑定、
+// 报修/派工/关闭/取消履历与保养计划（含保养建立/完成履历）复制到目标数据目录。
 //
 // 关键规则：
 //   - 导入是复制：源台账始终只读，不删除、不修改任何源记录；同一台账不能导入自身。
@@ -21,6 +21,8 @@ import (
 //   - 履历按源履历序号排列，在目标已有最大履历序号之后依次分配新序号，保留原操作
 //     顺序（不按时间重排）；履历时间保留原瞬间与小数秒精度。导入本身不追加报修
 //     或其他业务事件。
+//   - 保养计划随资产原样复制（内容、首次到期日、间隔与下一到期日不变），保养履历
+//     随资产履历一并复制，完成链自然接续；目标已有计划不受影响。
 //   - 资产编号在目标已存在，或所选工单的任一请求标识已在目标绑定时，整批拒绝：
 //     不覆盖、不合并、不改请求标识。
 //   - 操作前检查源、目标整库一致性，提交前由 save 再检查合并后的数据；整批变化
@@ -46,6 +48,7 @@ type ticketRemap struct {
 type importOutcome struct {
 	assetIDs []string
 	tickets  []ticketRemap
+	plans    int
 }
 
 func cmdImport(args []string, w io.Writer) error {
@@ -75,6 +78,9 @@ func cmdImport(args []string, w io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(w, "已导入 %d 项资产（%s）。\n", len(outcome.assetIDs), strings.Join(outcome.assetIDs, ", "))
+	if outcome.plans > 0 {
+		fmt.Fprintf(w, "同时导入 %d 项保养计划及其保养履历。\n", outcome.plans)
+	}
 	if len(outcome.tickets) == 0 {
 		fmt.Fprintln(w, "所选资产没有工单，未分配新工单编号。")
 		return nil
@@ -216,7 +222,17 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		na := *a
 		s.data.Assets = append(s.data.Assets, &na)
 	}
-	outcome := &importOutcome{assetIDs: ids}
+	// 所选资产的保养计划原样复制（内容、首次到期日、间隔与下一到期日不变）；
+	// 保养履历已随上方资产履历筛选一并复制，完成链自然接续。目标已有计划不变。
+	planCount := 0
+	for _, p := range src.data.Plans {
+		if selected[p.AssetID] {
+			np := *p
+			s.data.Plans = append(s.data.Plans, &np)
+			planCount++
+		}
+	}
+	outcome := &importOutcome{assetIDs: ids, plans: planCount}
 	remap := map[string]string{}
 	next := s.data.NextTicketSeq
 	for _, t := range tickets {

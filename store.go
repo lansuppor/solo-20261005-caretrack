@@ -27,6 +27,9 @@ const (
 	eventCancel = "取消"
 	eventAssign = "派工"
 
+	eventPlanCreate = "保养建立"
+	eventPlanDone   = "保养完成"
+
 	storeVersion = 1
 	dataFileName = "caretrack.json"
 )
@@ -62,8 +65,10 @@ type Ticket struct {
 	AssignNote   string `json:"assign_note,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/派工/关闭/取消/保养建立/保养完成），Seq 决定操作发生顺序。
 // From/To 仅派工履历使用：原负责人（首次派工为空，展示为“未派工”）与新负责人。
+// Due/Done/Interval 仅保养履历使用：建立履历含首次到期日（Due）与间隔天数
+// （Interval），完成履历含周期到期日（Due）与实际完成日（Done）。
 type Event struct {
 	Seq      int       `json:"-"`
 	AssetID  string    `json:"-"`
@@ -72,6 +77,9 @@ type Event struct {
 	Content  string    `json:"-"`
 	From     string    `json:"-"`
 	To       string    `json:"-"`
+	Due      string    `json:"-"`
+	Done     string    `json:"-"`
+	Interval int       `json:"-"`
 	Time     time.Time `json:"-"`
 }
 
@@ -79,11 +87,14 @@ type Event struct {
 type eventJSON struct {
 	Seq      int    `json:"seq"`
 	AssetID  string `json:"asset_id"`
-	TicketID string `json:"ticket_id"`
+	TicketID string `json:"ticket_id,omitempty"`
 	Kind     string `json:"kind"`
 	Content  string `json:"content"`
 	From     string `json:"from,omitempty"`
 	To       string `json:"to,omitempty"`
+	Due      string `json:"due,omitempty"`
+	Done     string `json:"done,omitempty"`
+	Interval int    `json:"interval,omitempty"`
 	Time     string `json:"time"`
 }
 
@@ -91,6 +102,7 @@ func (e Event) toJSON() eventJSON {
 	return eventJSON{
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
+		Due: e.Due, Done: e.Done, Interval: e.Interval,
 		// RFC3339Nano 保留小数秒精度；整秒时输出与 RFC3339 完全一致，
 		// 因此既有整秒台账的字节表示不变，而旧库中带小数秒的履历时间
 		// 在重新保存（含导入合并后的提交）时也不会被截断。
@@ -105,7 +117,8 @@ func (e eventJSON) toEvent() (Event, error) {
 	}
 	return Event{
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
-		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To, Time: t,
+		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
+		Due: e.Due, Done: e.Done, Interval: e.Interval, Time: t,
 	}, nil
 }
 
@@ -126,6 +139,7 @@ type storeData struct {
 	Events        []Event          `json:"-"`
 	EventsJSON    []eventJSON      `json:"events"`
 	Requests      []requestBinding `json:"requests"`
+	Plans         []*Plan          `json:"plans"`
 	NextTicketSeq int              `json:"next_ticket_seq"`
 }
 
@@ -143,6 +157,7 @@ func newStoreData() *storeData {
 		Events:        []Event{},
 		EventsJSON:    []eventJSON{},
 		Requests:      []requestBinding{},
+		Plans:         []*Plan{},
 		NextTicketSeq: 1,
 	}
 }
@@ -188,6 +203,10 @@ func loadStore(dir string, allowMissing bool) (*store, error) {
 			d.Events[i] = ev
 		}
 	}
+	// 无保养字段的有效旧库直接使用：缺省视为没有任何保养计划。
+	if d.Plans == nil {
+		d.Plans = []*Plan{}
+	}
 	if err := validateData(&d); err != nil {
 		return nil, fmt.Errorf("数据文件 %s 内容相互矛盾：%w（原文件已保留，未做任何修改）", path, err)
 	}
@@ -217,7 +236,7 @@ func validateData(d *storeData) error {
 	if d.Version != storeVersion {
 		return fmt.Errorf("不支持的数据版本 %d", d.Version)
 	}
-	if d.Assets == nil || d.Tickets == nil || d.Requests == nil || d.EventsJSON == nil || d.Events == nil {
+	if d.Assets == nil || d.Tickets == nil || d.Requests == nil || d.EventsJSON == nil || d.Events == nil || d.Plans == nil {
 		return errors.New("缺少必要的数据段")
 	}
 	assets := map[string]*Asset{}
@@ -349,8 +368,45 @@ func validateData(d *storeData) error {
 			return fmt.Errorf("履历矛盾：履历序号 %d 重复", e.Seq)
 		}
 		seenSeq[e.Seq] = true
-		if e.AssetID == "" || e.TicketID == "" || e.Kind == "" || e.Content == "" {
+		if e.AssetID == "" || e.Kind == "" || e.Content == "" {
 			return errors.New("履历矛盾：存在字段不完整的履历记录")
+		}
+		if e.Kind == eventPlanCreate || e.Kind == eventPlanDone {
+			// 保养履历：不属于任何工单，不携带派工字段；日期与间隔在此核对，
+			// 建立及完成链的接续在下方按序号重放时核对。
+			if e.TicketID != "" || e.From != "" || e.To != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有工单编号或派工人员字段", e.Seq, e.Kind)
+			}
+			due, err := parseDate(e.Due)
+			if err != nil {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录到期日无效", e.Seq, e.Kind)
+			}
+			if e.Kind == eventPlanCreate {
+				if e.Done != "" {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的建立记录不应带有完成日", e.Seq)
+				}
+				if e.Interval < 1 {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的建立记录间隔天数须为正整数", e.Seq)
+				}
+			} else {
+				if e.Interval != 0 {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的完成记录不应带有间隔天数", e.Seq)
+				}
+				done, err := parseDate(e.Done)
+				if err != nil {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的完成记录完成日无效", e.Seq)
+				}
+				if done < due {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的完成日早于周期到期日", e.Seq)
+				}
+			}
+			continue
+		}
+		if e.TicketID == "" {
+			return errors.New("履历矛盾：存在字段不完整的履历记录")
+		}
+		if e.Due != "" || e.Done != "" || e.Interval != 0 {
+			return fmt.Errorf("履历矛盾：履历序号 %d 的维修履历不应带有保养字段", e.Seq)
 		}
 		if e.Kind != eventAssign && (e.From != "" || e.To != "") {
 			return fmt.Errorf("履历矛盾：履历序号 %d 的 %s 记录不应带有派工人员字段", e.Seq, e.Kind)
@@ -491,6 +547,78 @@ func validateData(d *storeData) error {
 		if a.Status != want {
 			return fmt.Errorf("状态矛盾：按履历推进得到资产 %s 状态为 %s，与保存的 %s 不符",
 				a.ID, want, a.Status)
+		}
+	}
+	// 保养计划：归属存在的资产、每项资产最多一个、日期有效、间隔为正整数。
+	plans := map[string]*Plan{}
+	for _, p := range d.Plans {
+		if p == nil || p.AssetID == "" || p.Content == "" {
+			return errors.New("数据矛盾：存在字段不完整的保养计划")
+		}
+		if assets[p.AssetID] == nil {
+			return fmt.Errorf("数据矛盾：保养计划引用了不存在的资产 %s", p.AssetID)
+		}
+		if plans[p.AssetID] != nil {
+			return fmt.Errorf("数据矛盾：资产 %s 有多个保养计划，最多允许一个", p.AssetID)
+		}
+		if _, err := parseDate(p.FirstDue); err != nil {
+			return fmt.Errorf("数据矛盾：资产 %s 保养计划的首次到期日无效", p.AssetID)
+		}
+		if p.IntervalDays < 1 {
+			return fmt.Errorf("数据矛盾：资产 %s 保养计划的间隔天数须为正整数", p.AssetID)
+		}
+		if _, err := parseDate(p.NextDue); err != nil {
+			return fmt.Errorf("数据矛盾：资产 %s 保养计划的下一到期日无效", p.AssetID)
+		}
+		plans[p.AssetID] = p
+	}
+	// 保养履历链：每个计划恰有一条建立履历（内容、首次到期日、间隔与计划一致），
+	// 完成履历按序号接续（周期到期日须等于当前下一到期日，完成日不早于它），
+	// 由履历推出的下一到期日须与计划保存的一致。没有计划的资产不得有保养履历。
+	maintCreate := map[string]int{}
+	derivedDue := map[string]string{}
+	for _, e := range sorted {
+		if e.Kind != eventPlanCreate && e.Kind != eventPlanDone {
+			continue
+		}
+		p := plans[e.AssetID]
+		if p == nil {
+			return fmt.Errorf("履历矛盾：资产 %s 没有保养计划，却存在保养履历（序号 %d）", e.AssetID, e.Seq)
+		}
+		if e.Kind == eventPlanCreate {
+			if maintCreate[e.AssetID] != 0 {
+				return fmt.Errorf("履历矛盾：资产 %s 有多条保养建立履历", e.AssetID)
+			}
+			maintCreate[e.AssetID] = e.Seq
+			if e.Content != p.Content || e.Due != p.FirstDue || e.Interval != p.IntervalDays {
+				return fmt.Errorf("履历矛盾：资产 %s 的保养建立履历与计划内容、首次到期日或间隔不一致", e.AssetID)
+			}
+			derivedDue[e.AssetID] = e.Due
+			continue
+		}
+		if maintCreate[e.AssetID] == 0 {
+			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）出现在建立履历之前", e.AssetID, e.Seq)
+		}
+		if e.Due != derivedDue[e.AssetID] {
+			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）周期到期日 %s 与当前下一到期日 %s 不接续",
+				e.AssetID, e.Seq, e.Due, derivedDue[e.AssetID])
+		}
+		first, _ := parseDate(p.FirstDue)
+		done, _ := parseDate(e.Done)
+		next, ok := nextDueAfter(first, int64(p.IntervalDays), done)
+		if !ok {
+			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）无法推出日期范围内的下一到期日",
+				e.AssetID, e.Seq)
+		}
+		derivedDue[e.AssetID] = formatDate(next)
+	}
+	for _, p := range d.Plans {
+		if maintCreate[p.AssetID] == 0 {
+			return fmt.Errorf("履历矛盾：资产 %s 的保养计划应有恰一条建立履历，实际没有", p.AssetID)
+		}
+		if derivedDue[p.AssetID] != p.NextDue {
+			return fmt.Errorf("履历矛盾：按履历推出资产 %s 的下一到期日为 %s，与保存的 %s 不符",
+				p.AssetID, derivedDue[p.AssetID], p.NextDue)
 		}
 	}
 	return nil
