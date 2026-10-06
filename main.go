@@ -28,8 +28,11 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   ticket     按工单编号查询工单状态与负责人
   close      关闭工单并填写维修结果，设备恢复“可用”
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
-  history    按资产查看维修履历（报修、派工、关闭、取消事件）
+  history    按资产查看履历（报修、派工、关闭、取消与保养计划/完成事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
+  plan       为资产安排不可覆盖的周期保养计划
+  complete   登记一次实际保养完成，并推进下一到期日
+  due        按日期查询已到期（下一到期日不晚于该日）的保养计划
   import     从另一数据目录批量导入资产及其工单、履历与请求绑定（复制，源只读）
   help       显示本帮助
 
@@ -45,6 +48,11 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
   downtime --start 起点 --end 终点 [--asset-id 编号]          [--data-dir 目录]
+  plan     --asset-id 编号 --content 保养内容 --first-due 首次到期日
+           --interval-days 间隔天数                           [--data-dir 目录]
+  complete --asset-id 编号 --period-due 所完成周期的到期日
+           --done-date 实际完成日 --result 保养结果           [--data-dir 目录]
+  due      --date 日期                                        [--data-dir 目录]
   import   --source-dir 源目录 --asset-id 编号 [--asset-id 编号...]
                                                               [--data-dir 目录]
 
@@ -82,7 +90,23 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     时统计全部资产并按编号字典序排列，空库明确提示无记录并显示零合计。若所选
     资产任一终结工单的结束履历时间早于报修履历时间（即使该单在窗口外、结束
     等于开始合法），整次统计失败，指出资产与工单，不输出部分结果。
-  - import 把源数据目录中所选资产连同全部工单、报修请求绑定与履历复制到目标
+  - plan 为资产安排周期保养计划：输入资产编号、非空保养内容、首次到期日与正整数
+    间隔天数。每项资产最多一个且不可覆盖；未知资产、已有计划均拒绝。日期为
+    0001 至 9999 年的有效公历 YYYY-MM-DD，按日历日运算，不受时区和运行时刻
+    影响。成功显示首次到期日，并追加一条含初始计划的建立履历。资产详情显示
+    保养内容、间隔天数与下一到期日；无计划时明确提示。
+  - complete 登记一次实际保养：输入资产编号、所完成周期的到期日、实际完成日和
+    非空保养结果。所填到期日必须等于当前下一到期日，完成日不得早于它；无计划、
+    旧周期重复登记、提前完成新周期或日期不合条件均拒绝。成功后下一到期日为
+    “首次到期日加整数倍间隔”所得日期中严格晚于完成日的最早日期；延期跨过的
+    周期不生成完成记录，也不能改用完成日加间隔；无法在 9999-12-31 前得到
+    下一到期日时整次拒绝。输出完成周期与下一到期日。维修中的资产也可安排和
+    完成保养：不创建或终结故障工单、不消耗工单编号，不改变资产状态、请求绑定
+    与停机统计。
+  - due 为只读查询：按指定日期列出下一到期日不晚于该日的计划，显示资产编号、
+    名称、保养内容与到期日，先按到期日再按资产编号排序；无匹配明确提示。
+    查询不写文件、不初始化目录、不推进计划。
+  - import 把源数据目录中所选资产连同全部工单、保养计划、报修请求绑定与履历复制到目标
     目录（--data-dir）：源台账始终只读，同一台账不能导入自身；重复编号按一项
     处理。工单编号按源工单序号升序从目标下一序号重新分配，履历与请求绑定中的
     工单引用同步替换；履历在目标最大履历序号之后按源序号顺序分配新序号，保留
@@ -93,7 +117,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     容量不足、读写失败）都整批失败，两边原文件不变，不消耗目标编号。
 
 无参数、--help、-h 显示本帮助；参数错误或业务失败以非零退出码结束并说明原因。
-参数错误退出码为 2；未知资产、上述时间异常及数据读取失败退出码为 1。
+参数错误退出码为 2；未知资产、业务冲突、上述时间异常及数据读取失败退出码为 1。
 `
 
 type cmdOptions struct {
@@ -145,6 +169,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdHistory(args[1:], stdout)
 	case "downtime":
 		err = cmdDowntime(args[1:], stdout)
+	case "plan":
+		err = cmdPlan(args[1:], stdout)
+	case "complete":
+		err = cmdComplete(args[1:], stdout)
+	case "due":
+		err = cmdDue(args[1:], stdout)
 	case "import":
 		err = cmdImport(args[1:], stdout)
 	default:
@@ -302,6 +332,18 @@ func cmdDetail(args []string, w io.Writer) error {
 	} else {
 		fmt.Fprintf(w, "未关闭工单: %s\n", openTicket.ID)
 		fmt.Fprintf(w, "工单负责人: %s\n", assigneeDisplay(openTicket.Assignee))
+	}
+	if plan := s.findPlan(asset.ID); plan == nil {
+		fmt.Fprintln(w, "保养计划: 无")
+	} else {
+		nextDue, err := s.planNextDue(plan)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(w, "保养计划: 有")
+		fmt.Fprintf(w, "保养内容: %s\n", plan.Content)
+		fmt.Fprintf(w, "间隔天数: %d\n", plan.IntervalDays)
+		fmt.Fprintf(w, "下一到期日: %s\n", nextDue)
 	}
 	return nil
 }
@@ -508,19 +550,25 @@ func cmdHistory(args []string, w io.Writer) error {
 	}
 	events := s.eventsOf(id)
 	if len(events) == 0 {
-		fmt.Fprintf(w, "资产 %s 暂无维修履历。\n", id)
+		fmt.Fprintf(w, "资产 %s 暂无履历。\n", id)
 		return nil
 	}
-	fmt.Fprintf(w, "资产 %s 维修履历（共 %d 条）:\n", id, len(events))
+	fmt.Fprintf(w, "资产 %s 履历（共 %d 条）:\n", id, len(events))
 	for _, e := range events {
-		if e.Kind == eventAssign {
+		ts := e.Time.Format("2006-01-02T15:04:05Z07:00")
+		switch e.Kind {
+		case eventAssign:
 			fmt.Fprintf(w, "[%s] %s 工单 %s: %s -> %s（%s）\n",
-				e.Time.Format("2006-01-02T15:04:05Z07:00"), e.Kind, e.TicketID,
-				assigneeDisplay(e.From), e.To, e.Content)
-			continue
+				ts, e.Kind, e.TicketID, assigneeDisplay(e.From), e.To, e.Content)
+		case eventPlanCreate:
+			fmt.Fprintf(w, "[%s] %s: 首次到期日 %s，保养内容 %s\n",
+				ts, e.Kind, e.Due, e.Content)
+		case eventMaintDone:
+			fmt.Fprintf(w, "[%s] %s: 周期到期日 %s，实际完成日 %s，结果 %s\n",
+				ts, e.Kind, e.Due, e.Done, e.Content)
+		default:
+			fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n", ts, e.Kind, e.TicketID, e.Content)
 		}
-		fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n",
-			e.Time.Format("2006-01-02T15:04:05Z07:00"), e.Kind, e.TicketID, e.Content)
 	}
 	return nil
 }
@@ -598,5 +646,143 @@ func cmdDowntime(args []string, w io.Writer) error {
 		}
 	}
 	fmt.Fprintf(w, "合计: %d 秒\n", total)
+	return nil
+}
+
+// parseDateFlag 把 YYYY-MM-DD 参数解析为日期；格式不合法属于参数错误（退出码 2）。
+func parseDateFlag(fs *flag.FlagSet, flagName, value string) error {
+	if _, err := parseCalendarDate(value); err != nil {
+		return &usageError{msg: fmt.Sprintf("命令 %s 的 --%s %v", fs.Name(), flagName, err)}
+	}
+	return nil
+}
+
+func cmdPlan(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var assetID, content, firstDue string
+	var intervalDays int
+	fs := newFlagSet("plan", &opts)
+	fs.StringVar(&assetID, "asset-id", "", "企业资产编号（必填）")
+	fs.StringVar(&content, "content", "", "保养内容（必填，非空）")
+	fs.StringVar(&firstDue, "first-due", "", "首次到期日（必填，公历 YYYY-MM-DD）")
+	fs.IntVar(&intervalDays, "interval-days", 0, "间隔天数（必填，正整数）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, assetID, "asset-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, content, "content"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, firstDue, "first-due"); err != nil {
+		return err
+	}
+	if err := parseDateFlag(fs, "first-due", firstDue); err != nil {
+		return err
+	}
+	if intervalDays < 1 {
+		return &usageError{msg: "命令 plan 的 --interval-days 必须为正整数"}
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	plan, err := s.createPlan(assetID, content, firstDue, intervalDays)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "资产 %s 的保养计划已建立。\n", plan.AssetID)
+	fmt.Fprintf(w, "保养内容: %s\n", plan.Content)
+	fmt.Fprintf(w, "间隔天数: %d\n", plan.IntervalDays)
+	fmt.Fprintf(w, "首次到期日: %s\n", plan.FirstDue)
+	return nil
+}
+
+func cmdComplete(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var assetID, periodDue, doneDate, result string
+	fs := newFlagSet("complete", &opts)
+	fs.StringVar(&assetID, "asset-id", "", "企业资产编号（必填）")
+	fs.StringVar(&periodDue, "period-due", "", "所完成周期的到期日（必填，须等于当前下一到期日，公历 YYYY-MM-DD）")
+	fs.StringVar(&doneDate, "done-date", "", "实际完成日（必填，不得早于周期到期日，公历 YYYY-MM-DD）")
+	fs.StringVar(&result, "result", "", "保养结果（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, assetID, "asset-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, periodDue, "period-due"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, doneDate, "done-date"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, result, "result"); err != nil {
+		return err
+	}
+	if err := parseDateFlag(fs, "period-due", periodDue); err != nil {
+		return err
+	}
+	if err := parseDateFlag(fs, "done-date", doneDate); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	_, completedDue, nextDue, err := s.completeMaintenance(assetID, periodDue, doneDate, result)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "资产 %s 的保养已登记。\n", assetID)
+	fmt.Fprintf(w, "完成周期到期日: %s\n", completedDue)
+	fmt.Fprintf(w, "实际完成日: %s\n", doneDate)
+	fmt.Fprintf(w, "下一到期日: %s\n", nextDue)
+	return nil
+}
+
+// cmdDue 为只读到期查询：不保存，因此不写文件、不初始化目录、不推进计划。
+func cmdDue(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var asOf string
+	fs := newFlagSet("due", &opts)
+	fs.StringVar(&asOf, "date", "", "查询日期（必填，公历 YYYY-MM-DD）：列出下一到期日不晚于该日的计划")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, asOf, "date"); err != nil {
+		return err
+	}
+	if err := parseDateFlag(fs, "date", asOf); err != nil {
+		return err
+	}
+
+	// openStore 已先做整库一致性检查；查询本身不保存。
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	rows, err := s.duePlans(asOf)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Fprintf(w, "%s 前没有已到期的保养计划。\n", asOf)
+		return nil
+	}
+	fmt.Fprintf(w, "截至 %s 已到期的保养计划（共 %d 项）:\n", asOf, len(rows))
+	for _, r := range rows {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.AssetID, r.Name, r.Content, r.Due)
+	}
 	return nil
 }

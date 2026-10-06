@@ -216,6 +216,16 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		na := *a
 		s.data.Assets = append(s.data.Assets, &na)
 	}
+	// 所选资产的保养计划原样复制（含首次到期日、保养内容与间隔）。资产编号
+	// 本身是新导入的，目标不可能已有同资产的计划，故无冲突需要处理；完成
+	// 履历随下方的履历复制一并迁入，与计划的完成链保持续接。
+	for _, p := range src.data.Plans {
+		if !selected[p.AssetID] {
+			continue
+		}
+		np := *p
+		s.data.Plans = append(s.data.Plans, &np)
+	}
 	outcome := &importOutcome{assetIDs: ids}
 	remap := map[string]string{}
 	next := s.data.NextTicketSeq
