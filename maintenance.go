@@ -12,8 +12,9 @@ import (
 // time.Time 的时区、跨度（time.Duration 约 292 年上限）与年份范围问题。
 //
 // 每个计划恰有一条建立履历（含初始计划：内容、首次到期日、间隔天数），
-// 每次完成登记追加一条完成履历（含周期到期日、实际完成日、结果）。计划的
-// 下一到期日由履历链推出并保存在计划中，加载与保存时核对二者一致。
+// 每次完成登记追加一条完成履历（含周期到期日、实际完成日、结果），每次撤销
+// 误登记追加一条撤销履历（含目标完成履历序号、理由）。计划的下一到期日由
+// 履历链推出并保存在计划中，加载与保存时核对二者一致。
 // 保养不创建或终结工单、不消耗工单编号，不改变资产状态、请求绑定或停机统计。
 
 // Plan 为资产的周期保养计划；每项资产最多一个，不可覆盖。
@@ -195,47 +196,119 @@ func (s *store) createPlan(assetID, content, firstDue string, intervalDays int) 
 // （旧周期不能重复登记，也不能登记尚未到期的新周期），实际完成日不得早于
 // 周期到期日。成功时追加一条完成履历，并把下一到期日推进到首次到期日加整数倍
 // 间隔所得日期中严格晚于完成日的最早日期；延期跨过的周期不生成完成记录。
-// 若下一到期日超出 9999-12-31，整次拒绝。失败路径不修改任何业务数据。
-func (s *store) completePlan(assetID, due, done, result string) (*Plan, string, error) {
+// 若下一到期日超出 9999-12-31，整次拒绝。返回完成履历的全库序号。
+// 失败路径不修改任何业务数据。
+func (s *store) completePlan(assetID, due, done, result string) (*Plan, string, int, error) {
 	if s.findAsset(assetID) == nil {
-		return nil, "", fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
+		return nil, "", 0, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
 	}
 	p := s.findPlan(assetID)
 	if p == nil {
-		return nil, "", fmt.Errorf("%w: 资产 %s 没有保养计划", errNotFound, assetID)
+		return nil, "", 0, fmt.Errorf("%w: 资产 %s 没有保养计划", errNotFound, assetID)
 	}
 	if result == "" {
-		return nil, "", fmt.Errorf("%w: 保养结果不能为空", errConflict)
+		return nil, "", 0, fmt.Errorf("%w: 保养结果不能为空", errConflict)
 	}
 	dueN, err := parseDate(due)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: 周期到期日无效：%s", errConflict, err)
+		return nil, "", 0, fmt.Errorf("%w: 周期到期日无效：%s", errConflict, err)
 	}
 	doneN, err := parseDate(done)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: 实际完成日无效：%s", errConflict, err)
+		return nil, "", 0, fmt.Errorf("%w: 实际完成日无效：%s", errConflict, err)
 	}
 	if due != p.NextDue {
-		return nil, "", fmt.Errorf(
+		return nil, "", 0, fmt.Errorf(
 			"%w: 周期到期日 %s 与资产 %s 当前下一到期日 %s 不符（旧周期不能重复登记，也不能登记新周期）",
 			errConflict, due, assetID, p.NextDue)
 	}
 	if doneN < dueN {
-		return nil, "", fmt.Errorf("%w: 实际完成日 %s 早于周期到期日 %s", errConflict, done, due)
+		return nil, "", 0, fmt.Errorf("%w: 实际完成日 %s 早于周期到期日 %s", errConflict, done, due)
 	}
 	first, _ := parseDate(p.FirstDue)
 	next, ok := nextDueAfter(first, int64(p.IntervalDays), doneN)
 	if !ok {
-		return nil, "", fmt.Errorf(
+		return nil, "", 0, fmt.Errorf(
 			"%w: 按完成日 %s 推算的下一到期日超出 9999-12-31，无法登记本次完成", errConflict, done)
 	}
 	eventSeq, err := s.nextEventSeq()
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	p.NextDue = formatDate(next)
 	s.appendMaintEvent(eventSeq, assetID, eventPlanDone, result, due, done, 0)
-	return p, p.NextDue, nil
+	return p, p.NextDue, eventSeq, nil
+}
+
+// revokedDoneSeqs 返回已被撤销的保养完成履历序号集合。
+func (s *store) revokedDoneSeqs() map[int]bool {
+	revoked := map[int]bool{}
+	for _, e := range s.data.Events {
+		if e.Kind == eventPlanRevoke {
+			revoked[e.TargetSeq] = true
+		}
+	}
+	return revoked
+}
+
+// revokeCompletion 撤销误登记的保养完成：目标须为该资产按序号最新的未撤销完成
+// （存在更晚有效完成时拒绝；撤销后可继续撤销此前最新有效完成）。成功时保留原
+// 完成的日期、结果与时间，追加一条含目标序号、理由与操作时间的撤销履历，并把
+// 下一到期日恢复为该完成的周期到期日（延期跨过的周期不补记录）。维修或其他
+// 资产事件不阻止撤销。失败路径不修改任何业务数据。
+func (s *store) revokeCompletion(assetID string, targetSeq int, reason string) (*Plan, *Event, error) {
+	if s.findAsset(assetID) == nil {
+		return nil, nil, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
+	}
+	if reason == "" {
+		return nil, nil, fmt.Errorf("%w: 撤销理由不能为空", errConflict)
+	}
+	p := s.findPlan(assetID)
+	if p == nil {
+		return nil, nil, fmt.Errorf("%w: 资产 %s 没有保养计划", errNotFound, assetID)
+	}
+	var target *Event
+	for i := range s.data.Events {
+		if s.data.Events[i].Seq == targetSeq {
+			target = &s.data.Events[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, nil, fmt.Errorf("%w: 未知履历序号 %d", errNotFound, targetSeq)
+	}
+	if target.Kind != eventPlanDone || target.AssetID != assetID {
+		return nil, nil, fmt.Errorf("%w: 履历序号 %d 不是资产 %s 的保养完成履历", errConflict, targetSeq, assetID)
+	}
+	revoked := s.revokedDoneSeqs()
+	if revoked[targetSeq] {
+		return nil, nil, fmt.Errorf("%w: 完成履历序号 %d 已撤销，不能重复撤销", errConflict, targetSeq)
+	}
+	latest := 0
+	for _, e := range s.data.Events {
+		if e.AssetID == assetID && e.Kind == eventPlanDone && !revoked[e.Seq] && e.Seq > latest {
+			latest = e.Seq
+		}
+	}
+	if latest != targetSeq {
+		return nil, nil, fmt.Errorf(
+			"%w: 完成履历序号 %d 不是资产 %s 最新的有效完成（当前为序号 %d），存在更晚有效完成时不能撤销",
+			errConflict, targetSeq, assetID, latest)
+	}
+	eventSeq, err := s.nextEventSeq()
+	if err != nil {
+		return nil, nil, err
+	}
+	p.NextDue = target.Due
+	s.data.Events = append(s.data.Events, Event{
+		Seq:       eventSeq,
+		AssetID:   assetID,
+		Kind:      eventPlanRevoke,
+		Content:   reason,
+		TargetSeq: targetSeq,
+		Time:      s.now(),
+	})
+	return p, target, nil
 }
 
 // duePlanRow 为到期查询的一行结果。

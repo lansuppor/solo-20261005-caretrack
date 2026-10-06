@@ -13,7 +13,7 @@ import (
 
 // 资产批量导入：把源数据目录中所选资产连同其全部工单、报修请求绑定、
 // 报修/派工/关闭/取消履历、备件领用记录、附件索引（含登记/撤销履历）与
-// 保养计划（含保养建立/完成履历）复制到目标数据目录。
+// 保养计划（含保养建立/完成/撤销履历）复制到目标数据目录。
 //
 // 关键规则：
 //   - 导入是复制：源台账始终只读，不删除、不修改任何源记录；同一台账不能导入自身。
@@ -30,7 +30,9 @@ import (
 //     顺序（不按时间重排）；履历时间保留原瞬间与小数秒精度。导入本身不追加报修
 //     或其他业务事件。
 //   - 保养计划随资产原样复制（内容、首次到期日、间隔与下一到期日不变），保养履历
-//     随资产履历一并复制，完成链自然接续；目标已有计划不受影响。
+//     （含撤销履历）随资产履历一并复制，完成与撤销链自然接续，撤销履历中的目标
+//     完成序号随履历重编号同步替换，并输出完成履历序号的原、新映射；目标已有计划
+//     不受影响。导入后可用新完成序号继续撤销。
 //   - 资产编号在目标已存在，或所选工单的任一请求标识已在目标绑定时，整批拒绝：
 //     不覆盖、不合并、不改请求标识。
 //   - 操作前检查源、目标整库一致性，提交前由 save 再检查合并后的数据；整批变化
@@ -64,12 +66,19 @@ type attachRemap struct {
 	NewID string
 }
 
+// completionRemap 记录一条保养完成履历的原全库序号与新全库序号。
+type completionRemap struct {
+	OldSeq int
+	NewSeq int
+}
+
 // importOutcome 为一次成功导入的结果摘要，用于输出。
 type importOutcome struct {
 	assetIDs    []string
 	tickets     []ticketRemap
 	parts       []partRemap
 	attachments []attachRemap
+	completions []completionRemap
 	plans       int
 }
 
@@ -121,6 +130,12 @@ func cmdImport(args []string, w io.Writer) error {
 		fmt.Fprintln(w, "附件编号映射（原编号 -> 新编号）:")
 		for _, m := range outcome.attachments {
 			fmt.Fprintf(w, "%s -> %s\n", m.OldID, m.NewID)
+		}
+	}
+	if len(outcome.completions) > 0 {
+		fmt.Fprintln(w, "完成履历序号映射（原序号 -> 新序号）:")
+		for _, m := range outcome.completions {
+			fmt.Fprintf(w, "%d -> %d\n", m.OldSeq, m.NewSeq)
 		}
 	}
 	return nil
@@ -366,6 +381,7 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 	}
 	s.data.NextAttachSeq = nextAttach
 	seq := maxSeq
+	seqRemap := map[int]int{}
 	for _, e := range events {
 		seq++
 		ne := e
@@ -373,6 +389,15 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		ne.TicketID = remap[e.TicketID]
 		ne.WithdrawalID = partIDs[e.WithdrawalID]
 		ne.AttachmentID = attachIDs[e.AttachmentID]
+		if e.Kind == eventPlanRevoke {
+			// 撤销履历的目标完成序号随履历重编号同步替换：目标在源序号顺序中
+			// 先于撤销出现（源台账已通过一致性检查），此处必然已有映射。
+			ne.TargetSeq = seqRemap[e.TargetSeq]
+		}
+		seqRemap[e.Seq] = seq
+		if e.Kind == eventPlanDone {
+			outcome.completions = append(outcome.completions, completionRemap{OldSeq: e.Seq, NewSeq: seq})
+		}
 		s.data.Events = append(s.data.Events, ne)
 	}
 	return outcome, nil

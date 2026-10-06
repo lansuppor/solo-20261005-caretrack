@@ -110,7 +110,7 @@ func TestCompleteDelayedSkipsCycles(t *testing.T) {
 	}
 	// 到期日 2026-01-01，延期到 2026-01-25 完成：跨过 01-11、01-21 两个周期，
 	// 下一到期日为 01-31（首次+3*10），而非 01-25+10=02-04。
-	p, next, err := s.completePlan("EQ-1", "2026-01-01", "2026-01-25", "已更换")
+	p, next, _, err := s.completePlan("EQ-1", "2026-01-01", "2026-01-25", "已更换")
 	if err != nil {
 		t.Fatalf("completePlan: %v", err)
 	}
@@ -143,32 +143,32 @@ func TestCompleteOldCycleRepeatRejected(t *testing.T) {
 	if _, err := s.registerAsset("EQ-2", "空调", "二楼"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.completePlan("EQ-2", "2026-01-01", "2026-01-01", "结果"); !errors.Is(err, errNotFound) {
+	if _, _, _, err := s.completePlan("EQ-2", "2026-01-01", "2026-01-01", "结果"); !errors.Is(err, errNotFound) {
 		t.Fatalf("无计划应失败，得到 %v", err)
 	}
 	// 完成日早于到期日拒绝。
-	if _, _, err := s.completePlan("EQ-1", "2026-01-01", "2025-12-31", "结果"); !errors.Is(err, errConflict) {
+	if _, _, _, err := s.completePlan("EQ-1", "2026-01-01", "2025-12-31", "结果"); !errors.Is(err, errConflict) {
 		t.Fatalf("完成日早于到期日应失败，得到 %v", err)
 	}
 	// 空结果拒绝。
-	if _, _, err := s.completePlan("EQ-1", "2026-01-01", "2026-01-01", ""); !errors.Is(err, errConflict) {
+	if _, _, _, err := s.completePlan("EQ-1", "2026-01-01", "2026-01-01", ""); !errors.Is(err, errConflict) {
 		t.Fatalf("空结果应失败，得到 %v", err)
 	}
 	// 尚未到期的新周期不能登记。
-	if _, _, err := s.completePlan("EQ-1", "2026-01-11", "2026-01-11", "结果"); !errors.Is(err, errConflict) {
+	if _, _, _, err := s.completePlan("EQ-1", "2026-01-11", "2026-01-11", "结果"); !errors.Is(err, errConflict) {
 		t.Fatalf("登记新周期应失败，得到 %v", err)
 	}
 
 	// 正常完成两个周期：01-01 当天完成 → 下一 01-11；01-11 当天完成 → 下一 01-21。
-	if _, next, err := s.completePlan("EQ-1", "2026-01-01", "2026-01-01", "第一次"); err != nil || next != "2026-01-11" {
+	if _, next, _, err := s.completePlan("EQ-1", "2026-01-01", "2026-01-01", "第一次"); err != nil || next != "2026-01-11" {
 		t.Fatalf("第一周期: next=%q err=%v", next, err)
 	}
-	if _, next, err := s.completePlan("EQ-1", "2026-01-11", "2026-01-11", "第二次"); err != nil || next != "2026-01-21" {
+	if _, next, _, err := s.completePlan("EQ-1", "2026-01-11", "2026-01-11", "第二次"); err != nil || next != "2026-01-21" {
 		t.Fatalf("第二周期: next=%q err=%v", next, err)
 	}
 	// 旧周期重复登记拒绝，状态不推进。
 	for _, due := range []string{"2026-01-01", "2026-01-11"} {
-		if _, _, err := s.completePlan("EQ-1", due, "2026-01-21", "重复"); !errors.Is(err, errConflict) {
+		if _, _, _, err := s.completePlan("EQ-1", due, "2026-01-21", "重复"); !errors.Is(err, errConflict) {
 			t.Fatalf("旧周期 %s 重复应失败，得到 %v", due, err)
 		}
 	}
@@ -191,7 +191,7 @@ func TestLeapDayArithmetic(t *testing.T) {
 	if _, err := s.createPlan("EQ-1", "年检", "2024-02-29", 365); err != nil {
 		t.Fatal(err)
 	}
-	if _, next, err := s.completePlan("EQ-1", "2024-02-29", "2024-02-29", "完成"); err != nil || next != "2025-02-28" {
+	if _, next, _, err := s.completePlan("EQ-1", "2024-02-29", "2024-02-29", "完成"); err != nil || next != "2025-02-28" {
 		t.Fatalf("闰日完成: next=%q err=%v", next, err)
 	}
 	// 2025-02-29 无效（平年）。
@@ -205,7 +205,7 @@ func TestLeapDayArithmetic(t *testing.T) {
 	if _, err := s.createPlan("EQ-2", "日检", "2024-02-28", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, next, err := s.completePlan("EQ-2", "2024-02-28", "2024-02-28", "完成"); err != nil || next != "2024-02-29" {
+	if _, next, _, err := s.completePlan("EQ-2", "2024-02-28", "2024-02-28", "完成"); err != nil || next != "2024-02-29" {
 		t.Fatalf("跨闰日: next=%q err=%v", next, err)
 	}
 	// 2100 年不是闰年：2100-02-28 + 1 = 2100-03-01。
@@ -215,7 +215,7 @@ func TestLeapDayArithmetic(t *testing.T) {
 	if _, err := s.createPlan("EQ-3", "日检", "2100-02-28", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, next, err := s.completePlan("EQ-3", "2100-02-28", "2100-02-28", "完成"); err != nil || next != "2100-03-01" {
+	if _, next, _, err := s.completePlan("EQ-3", "2100-02-28", "2100-02-28", "完成"); err != nil || next != "2100-03-01" {
 		t.Fatalf("2100 非闰年: next=%q err=%v", next, err)
 	}
 	// 延期跨过闰日：2024-02-28 到期、间隔 1、2024-03-01 完成 → 下一 2024-03-02。
@@ -225,7 +225,7 @@ func TestLeapDayArithmetic(t *testing.T) {
 	if _, err := s.createPlan("EQ-4", "日检", "2024-02-27", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, next, err := s.completePlan("EQ-4", "2024-02-27", "2024-03-01", "完成"); err != nil || next != "2024-03-02" {
+	if _, next, _, err := s.completePlan("EQ-4", "2024-02-27", "2024-03-01", "完成"); err != nil || next != "2024-03-02" {
 		t.Fatalf("延期跨闰日: next=%q err=%v", next, err)
 	}
 }
@@ -245,7 +245,7 @@ func TestLegacyStoreWithoutPlansField(t *testing.T) {
 	if _, err := s.createPlan("EQ-1", "更换滤芯", "2026-11-01", 90); err != nil {
 		t.Fatalf("旧库建立计划: %v", err)
 	}
-	if _, next, err := s.completePlan("EQ-1", "2026-11-01", "2026-11-02", "已更换"); err != nil {
+	if _, next, _, err := s.completePlan("EQ-1", "2026-11-01", "2026-11-02", "已更换"); err != nil {
 		t.Fatalf("旧库完成登记: %v", err)
 	} else if next != "2027-01-30" {
 		t.Fatalf("下一到期日 = %q，想得到 2027-01-30", next)
@@ -284,7 +284,7 @@ func TestMaintenanceInterleavedWithRepair(t *testing.T) {
 	if _, err := s.createPlan("EQ-1", "更换滤芯", "2026-11-01", 90); err != nil {
 		t.Fatalf("维修中建立计划: %v", err)
 	}
-	if _, _, err := s.completePlan("EQ-1", "2026-11-01", "2026-11-02", "已更换"); err != nil {
+	if _, _, _, err := s.completePlan("EQ-1", "2026-11-01", "2026-11-02", "已更换"); err != nil {
 		t.Fatalf("维修中登记完成: %v", err)
 	}
 	// 资产状态、工单、编号计数器、请求绑定均不变。
@@ -310,7 +310,7 @@ func TestMaintenanceInterleavedWithRepair(t *testing.T) {
 	if _, _, err := s.closeTicket(tk.ID, "已修复"); err != nil {
 		t.Fatal(err)
 	}
-	if _, next, err := s.completePlan("EQ-1", "2027-01-30", "2027-01-30", "第二次"); err != nil || next != "2027-04-30" {
+	if _, next, _, err := s.completePlan("EQ-1", "2027-01-30", "2027-01-30", "第二次"); err != nil || next != "2027-04-30" {
 		t.Fatalf("关闭后登记完成: next=%q err=%v", next, err)
 	}
 	if got := s.findAsset("EQ-1").Status; got != statusAvailable {
@@ -436,7 +436,7 @@ func TestImportCopiesPlans(t *testing.T) {
 	if _, err := src.createPlan("EQ-A", "更换滤芯", "2026-01-01", 10); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := src.completePlan("EQ-A", "2026-01-01", "2026-01-25", "已更换"); err != nil {
+	if _, _, _, err := src.completePlan("EQ-A", "2026-01-01", "2026-01-25", "已更换"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := src.report("EQ-A", "卡纸", "req-a1"); err != nil {
@@ -486,7 +486,7 @@ func TestImportCopiesPlans(t *testing.T) {
 		t.Fatal("未选择的资产不应导入计划")
 	}
 	// 完成链接续：可在目标继续登记下一周期。
-	if _, next, err := re.completePlan("EQ-A", "2026-01-31", "2026-01-31", "目标完成"); err != nil || next != "2026-02-10" {
+	if _, next, _, err := re.completePlan("EQ-A", "2026-01-31", "2026-01-31", "目标完成"); err != nil || next != "2026-02-10" {
 		t.Fatalf("导入后完成链接续: next=%q err=%v", next, err)
 	}
 	mustSave(t, re)
@@ -530,7 +530,7 @@ func TestCompleteOverflowRejectedAndRetry(t *testing.T) {
 	before := readFileBytes(t, s.dir)
 
 	// 完成日 9999-12-31：下一到期日须严格晚于它，即 9999-01-01+728 天，越界。
-	if _, _, err := s.completePlan("EQ-1", "9999-01-01", "9999-12-31", "完成"); !errors.Is(err, errConflict) {
+	if _, _, _, err := s.completePlan("EQ-1", "9999-01-01", "9999-12-31", "完成"); !errors.Is(err, errConflict) {
 		t.Fatalf("下一到期日越界应整次拒绝，得到 %v", err)
 	}
 	// 不推进日期、不新增履历。
@@ -546,7 +546,7 @@ func TestCompleteOverflowRejectedAndRetry(t *testing.T) {
 	}
 	// 重载后状态保持，可用更早完成日重试成功。
 	s = saveAndReopen(t, s)
-	if _, next, err := s.completePlan("EQ-1", "9999-01-01", "9999-01-01", "完成"); err != nil || next != "9999-12-31" {
+	if _, next, _, err := s.completePlan("EQ-1", "9999-01-01", "9999-01-01", "完成"); err != nil || next != "9999-12-31" {
 		t.Fatalf("重试应成功: next=%q err=%v", next, err)
 	}
 	if err := s.save(); err != nil {
@@ -557,7 +557,7 @@ func TestCompleteOverflowRejectedAndRetry(t *testing.T) {
 		t.Fatalf("重载后下一到期日 = %q", got.NextDue)
 	}
 	// 到达范围尽头后，再次完成必然越界，整次拒绝。
-	if _, _, err := s.completePlan("EQ-1", "9999-12-31", "9999-12-31", "完成"); !errors.Is(err, errConflict) {
+	if _, _, _, err := s.completePlan("EQ-1", "9999-12-31", "9999-12-31", "完成"); !errors.Is(err, errConflict) {
 		t.Fatalf("范围尽头完成应拒绝，得到 %v", err)
 	}
 }
