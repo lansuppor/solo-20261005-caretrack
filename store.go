@@ -33,6 +33,9 @@ const (
 	eventPartWithdraw = "领用"
 	eventPartReturn   = "退回"
 
+	eventAttach = "附件登记"
+	eventRevoke = "附件撤销"
+
 	storeVersion = 1
 	dataFileName = "caretrack.json"
 )
@@ -68,12 +71,14 @@ type Ticket struct {
 	AssignNote   string `json:"assign_note,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消/保养建立/保养完成/领用/退回），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/派工/关闭/取消/保养建立/保养完成/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
 // From/To 仅派工履历使用：原负责人（首次派工为空，展示为“未派工”）与新负责人。
 // Due/Done/Interval 仅保养履历使用：建立履历含首次到期日（Due）与间隔天数
 // （Interval），完成履历含周期到期日（Due）与实际完成日（Done）。
 // PartID/Quantity/WithdrawalID 仅备件履历使用：领用与退回履历都携带备件编号、
 // 数量与所属领用编号；Content 分别为领用说明与退回理由。
+// AttachmentID/Path 仅附件履历使用：登记与撤销履历都携带附件编号与绝对路径；
+// Content 分别为登记说明与撤销理由。
 type Event struct {
 	Seq          int       `json:"-"`
 	AssetID      string    `json:"-"`
@@ -88,6 +93,8 @@ type Event struct {
 	PartID       string    `json:"-"`
 	Quantity     int       `json:"-"`
 	WithdrawalID string    `json:"-"`
+	AttachmentID string    `json:"-"`
+	Path         string    `json:"-"`
 	Time         time.Time `json:"-"`
 }
 
@@ -106,6 +113,8 @@ type eventJSON struct {
 	PartID       string `json:"part_id,omitempty"`
 	Quantity     int    `json:"quantity,omitempty"`
 	WithdrawalID string `json:"withdrawal_id,omitempty"`
+	AttachmentID string `json:"attachment_id,omitempty"`
+	Path         string `json:"path,omitempty"`
 	Time         string `json:"time"`
 }
 
@@ -115,6 +124,7 @@ func (e Event) toJSON() eventJSON {
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
 		Due: e.Due, Done: e.Done, Interval: e.Interval,
 		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
+		AttachmentID: e.AttachmentID, Path: e.Path,
 		// RFC3339Nano 保留小数秒精度；整秒时输出与 RFC3339 完全一致，
 		// 因此既有整秒台账的字节表示不变，而旧库中带小数秒的履历时间
 		// 在重新保存（含导入合并后的提交）时也不会被截断。
@@ -132,6 +142,7 @@ func (e eventJSON) toEvent() (Event, error) {
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
 		Due: e.Due, Done: e.Done, Interval: e.Interval,
 		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
+		AttachmentID: e.AttachmentID, Path: e.Path,
 		Time: t,
 	}, nil
 }
@@ -147,6 +158,19 @@ type PartWithdrawal struct {
 	Quantity int    `json:"quantity"`
 	Note     string `json:"note"`
 	Returned int    `json:"returned"`
+}
+
+// Attachment 为一条工单附件索引：只保存本地文件的引用（绝对路径），不复制、
+// 修改或删除资料文件。ID 即附件编号（同目录唯一、不复用）。Revoked 为 true 时
+// 记录保留，RevokeReason 为撤销理由；已撤销编号不能恢复，可重新登记为新索引。
+type Attachment struct {
+	ID           string `json:"id"`
+	TicketID     string `json:"ticket_id"`
+	AssetID      string `json:"asset_id"`
+	Path         string `json:"path"`
+	Note         string `json:"note"`
+	Revoked      bool   `json:"revoked"`
+	RevokeReason string `json:"revoke_reason,omitempty"`
 }
 
 // requestBinding 记录请求标识与具体报修的绑定，用于去重与冲突拒绝；
@@ -168,8 +192,10 @@ type storeData struct {
 	Requests      []requestBinding  `json:"requests"`
 	Plans         []*Plan           `json:"plans"`
 	Parts         []*PartWithdrawal `json:"parts"`
+	Attachments   []*Attachment     `json:"attachments"`
 	NextTicketSeq int               `json:"next_ticket_seq"`
 	NextPartSeq   int               `json:"next_part_seq"`
+	NextAttachSeq int               `json:"next_attach_seq"`
 }
 
 type store struct {
@@ -188,8 +214,10 @@ func newStoreData() *storeData {
 		Requests:      []requestBinding{},
 		Plans:         []*Plan{},
 		Parts:         []*PartWithdrawal{},
+		Attachments:   []*Attachment{},
 		NextTicketSeq: 1,
 		NextPartSeq:   1,
+		NextAttachSeq: 1,
 	}
 }
 
@@ -246,6 +274,14 @@ func loadStore(dir string, allowMissing bool) (*store, error) {
 	if d.NextPartSeq == 0 && len(d.Parts) == 0 {
 		d.NextPartSeq = 1
 	}
+	// 无附件字段的有效旧库直接使用：缺省视为没有任何附件索引，
+	// 附件编号计数器从 1 开始。
+	if d.Attachments == nil {
+		d.Attachments = []*Attachment{}
+	}
+	if d.NextAttachSeq == 0 && len(d.Attachments) == 0 {
+		d.NextAttachSeq = 1
+	}
 	if err := validateData(&d); err != nil {
 		return nil, fmt.Errorf("数据文件 %s 内容相互矛盾：%w（原文件已保留，未做任何修改）", path, err)
 	}
@@ -284,6 +320,22 @@ func parsePartSeq(id string) (int, bool) {
 	return n, true
 }
 
+// parseAttachSeq 解析 A 加补零正整数序号形式的附件编号，返回序号。
+// 编号必须与 fmt.Sprintf("A%04d", n)（n ≥ 1）完全一致，否则视为非法。
+func parseAttachSeq(id string) (int, bool) {
+	if !strings.HasPrefix(id, "A") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(id[1:])
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	if fmt.Sprintf("A%04d", n) != id {
+		return 0, false
+	}
+	return n, true
+}
+
 // validateData 校验整份业务数据的内部一致性。任何矛盾都会返回指明问题类别
 // （计数器/请求绑定/状态/履历）的错误；调用方必须拒绝查询与写入并保留原文件。
 // 不做任何修复：不补字段、不重编号、不删除记录。
@@ -291,7 +343,7 @@ func validateData(d *storeData) error {
 	if d.Version != storeVersion {
 		return fmt.Errorf("不支持的数据版本 %d", d.Version)
 	}
-	if d.Assets == nil || d.Tickets == nil || d.Requests == nil || d.EventsJSON == nil || d.Events == nil || d.Plans == nil || d.Parts == nil {
+	if d.Assets == nil || d.Tickets == nil || d.Requests == nil || d.EventsJSON == nil || d.Events == nil || d.Plans == nil || d.Parts == nil || d.Attachments == nil {
 		return errors.New("缺少必要的数据段")
 	}
 	assets := map[string]*Asset{}
@@ -394,6 +446,50 @@ func validateData(d *storeData) error {
 	if d.NextPartSeq < 1 || d.NextPartSeq <= maxPartSeq {
 		return fmt.Errorf("计数器矛盾：下一领用序号 %d 必须为正并大于全部已用序号（当前最大 %d）",
 			d.NextPartSeq, maxPartSeq)
+	}
+	// 附件索引：编号唯一且为 A 加补零正整数序号，归属存在的工单且资产归属与工单
+	// 一致，保存的路径为绝对路径，说明非空；已撤销记录须有非空撤销理由，未撤销
+	// 记录不得带有理由。文件当前是否存在、可读不参与整库一致性校验。
+	attachments := map[string]*Attachment{}
+	maxAttachSeq := 0
+	for _, a := range d.Attachments {
+		if a == nil || a.ID == "" || a.TicketID == "" || a.AssetID == "" || a.Path == "" || a.Note == "" {
+			return errors.New("数据矛盾：存在字段不完整的附件记录")
+		}
+		n, ok := parseAttachSeq(a.ID)
+		if !ok {
+			return fmt.Errorf("计数器矛盾：附件编号 %q 不是 A 加补零正整数序号的形式", a.ID)
+		}
+		if n > maxAttachSeq {
+			maxAttachSeq = n
+		}
+		if !filepath.IsAbs(a.Path) {
+			return fmt.Errorf("数据矛盾：附件记录 %s 的路径 %q 不是绝对路径", a.ID, a.Path)
+		}
+		if a.Revoked {
+			if a.RevokeReason == "" {
+				return fmt.Errorf("状态矛盾：已撤销附件 %s 缺少撤销理由", a.ID)
+			}
+		} else if a.RevokeReason != "" {
+			return fmt.Errorf("状态矛盾：未撤销附件 %s 不应带有撤销理由", a.ID)
+		}
+		t := tickets[a.TicketID]
+		if t == nil {
+			return fmt.Errorf("数据矛盾：附件记录 %s 引用了不存在的工单 %s", a.ID, a.TicketID)
+		}
+		if t.AssetID != a.AssetID {
+			return fmt.Errorf("数据矛盾：附件记录 %s 的资产 %s 与工单 %s 归属的资产 %s 不一致",
+				a.ID, a.AssetID, t.ID, t.AssetID)
+		}
+		if attachments[a.ID] != nil {
+			return fmt.Errorf("数据矛盾：附件编号 %s 重复", a.ID)
+		}
+		attachments[a.ID] = a
+	}
+	// 下一附件序号必须为正并大于全部已用序号（允许有间隔）。
+	if d.NextAttachSeq < 1 || d.NextAttachSeq <= maxAttachSeq {
+		return fmt.Errorf("计数器矛盾：下一附件序号 %d 必须为正并大于全部已用序号（当前最大 %d）",
+			d.NextAttachSeq, maxAttachSeq)
 	}
 	// 请求绑定：每张工单恰有一条绑定，且请求标识、资产、描述、工单编号完全一致。
 	boundReq := map[string]bool{}
@@ -506,6 +602,13 @@ func validateData(d *storeData) error {
 		if e.Kind != eventAssign && (e.From != "" || e.To != "") {
 			return fmt.Errorf("履历矛盾：履历序号 %d 的 %s 记录不应带有派工人员字段", e.Seq, e.Kind)
 		}
+		if e.Kind != eventAttach && e.Kind != eventRevoke && (e.AttachmentID != "" || e.Path != "") {
+			return fmt.Errorf("履历矛盾：履历序号 %d 的 %s 记录不应带有附件字段", e.Seq, e.Kind)
+		}
+		if (e.Kind == eventAttach || e.Kind == eventRevoke) &&
+			(e.PartID != "" || e.WithdrawalID != "" || e.Quantity != 0) {
+			return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有备件字段", e.Seq, e.Kind)
+		}
 		if e.Kind == eventAssign {
 			if e.To == "" {
 				return fmt.Errorf("履历矛盾：履历序号 %d 的派工记录缺少新负责人", e.Seq)
@@ -557,6 +660,19 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：履历序号 %d 的领用编号 %q 不是 P 加补零正整数序号的形式",
 					e.Seq, e.WithdrawalID)
 			}
+		case eventAttach, eventRevoke:
+			// 内容即登记说明或撤销理由（非空已检查）；附件字段在此核对，
+			// 与附件记录的接续及撤销状态在下方按序号重放时核对。
+			if e.AttachmentID == "" || e.Path == "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录缺少附件编号或路径", e.Seq, e.Kind)
+			}
+			if _, ok := parseAttachSeq(e.AttachmentID); !ok {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的附件编号 %q 不是 A 加补零正整数序号的形式",
+					e.Seq, e.AttachmentID)
+			}
+			if !filepath.IsAbs(e.Path) {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的附件路径 %q 不是绝对路径", e.Seq, e.Path)
+			}
 		default:
 			return fmt.Errorf("履历矛盾：履历序号 %d 的事件类型无效 %q", e.Seq, e.Kind)
 		}
@@ -599,6 +715,8 @@ func validateData(d *storeData) error {
 	derivedNote := map[string]string{}
 	withdrawSeq := map[string]int{}
 	derivedReturned := map[string]int{}
+	attachSeq := map[string]int{}
+	revokeSeq := map[string]int{}
 	for _, e := range sorted {
 		switch e.Kind {
 		case eventReport:
@@ -681,6 +799,49 @@ func validateData(d *storeData) error {
 					p.ID, e.Seq, p.Quantity)
 			}
 			derivedReturned[p.ID] += e.Quantity
+		case eventAttach:
+			// 登记须在报修之后；工单未关闭、已关闭或已取消均可补充资料。
+			// 履历与附件记录的业务字段必须一致。
+			if derivedTicket[e.TicketID] == "" {
+				return fmt.Errorf("履历矛盾：附件登记履历（序号 %d）出现在工单 %s 的报修履历之前",
+					e.Seq, e.TicketID)
+			}
+			a := attachments[e.AttachmentID]
+			if a == nil {
+				return fmt.Errorf("履历矛盾：登记履历（序号 %d）引用了不存在的附件记录 %s",
+					e.Seq, e.AttachmentID)
+			}
+			if attachSeq[a.ID] != 0 {
+				return fmt.Errorf("履历矛盾：附件记录 %s 有多条登记履历", a.ID)
+			}
+			if a.TicketID != e.TicketID || a.AssetID != e.AssetID || a.Path != e.Path || a.Note != e.Content {
+				return fmt.Errorf("履历矛盾：登记履历（序号 %d）与附件记录 %s 的工单、资产、路径或说明不一致",
+					e.Seq, a.ID)
+			}
+			attachSeq[a.ID] = e.Seq
+		case eventRevoke:
+			// 撤销须在登记之后，至多一次；与工单状态、文件当前可用性无关。
+			a := attachments[e.AttachmentID]
+			if a == nil {
+				return fmt.Errorf("履历矛盾：撤销履历（序号 %d）引用了不存在的附件记录 %s",
+					e.Seq, e.AttachmentID)
+			}
+			if attachSeq[a.ID] == 0 {
+				return fmt.Errorf("履历矛盾：撤销履历（序号 %d）出现在附件记录 %s 的登记履历之前",
+					e.Seq, a.ID)
+			}
+			if revokeSeq[a.ID] != 0 {
+				return fmt.Errorf("履历矛盾：附件记录 %s 有多条撤销履历", a.ID)
+			}
+			if a.TicketID != e.TicketID || a.AssetID != e.AssetID || a.Path != e.Path {
+				return fmt.Errorf("履历矛盾：撤销履历（序号 %d）与附件记录 %s 的工单、资产或路径不一致",
+					e.Seq, a.ID)
+			}
+			if a.RevokeReason != e.Content {
+				return fmt.Errorf("履历矛盾：附件记录 %s 的撤销理由与撤销履历（序号 %d）内容不一致",
+					a.ID, e.Seq)
+			}
+			revokeSeq[a.ID] = e.Seq
 		}
 	}
 	for _, t := range d.Tickets {
@@ -705,6 +866,16 @@ func validateData(d *storeData) error {
 		if derivedReturned[p.ID] != p.Returned {
 			return fmt.Errorf("备件数量矛盾：按履历推出领用记录 %s 的累计退回为 %d，与保存的 %d 不符",
 				p.ID, derivedReturned[p.ID], p.Returned)
+		}
+	}
+	// 每条附件记录恰有一条登记履历（唯一性已在重放时核对）；撤销履历至多一条，
+	// 记录的撤销状态须与履历一致（撤销理由已在重放时逐条核对）。
+	for _, a := range d.Attachments {
+		if attachSeq[a.ID] == 0 {
+			return fmt.Errorf("履历矛盾：附件记录 %s 缺少对应的登记履历", a.ID)
+		}
+		if revoked := revokeSeq[a.ID] != 0; revoked != a.Revoked {
+			return fmt.Errorf("状态矛盾：附件记录 %s 保存的撤销状态与履历不一致", a.ID)
 		}
 	}
 	for _, a := range d.Assets {

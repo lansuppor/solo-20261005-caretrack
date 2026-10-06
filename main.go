@@ -33,9 +33,11 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   due        按指定日期列出到期的保养计划（只读）
   withdraw   为未关闭工单领用备件，生成领用编号
   return     按领用编号退回备件（允许多次部分退回）
-  history    按资产查看履历（报修、派工、关闭、取消、保养建立与完成、备件领用与退回事件）
+  attach     为工单登记本地资料文件的附件索引（只保存引用，不复制文件）
+  revoke     按附件编号撤销附件索引（保留记录与理由）
+  history    按资产查看履历（报修、派工、关闭、取消、保养建立与完成、备件领用与退回、附件登记与撤销事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
-  import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划与备件记录（复制，源只读）
+  import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划、备件记录与附件索引（复制，源只读）
   help       显示本帮助
 
 各命令参数:
@@ -57,6 +59,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
                                                               [--data-dir 目录]
   return   --withdrawal-id 领用编号 --quantity 数量 --reason 理由
                                                               [--data-dir 目录]
+  attach   --ticket-id 工单编号 --path 文件路径 --note 说明   [--data-dir 目录]
+  revoke   --attachment-id 附件编号 --reason 理由             [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
   downtime --start 起点 --end 终点 [--asset-id 编号]          [--data-dir 目录]
   import   --source-dir 源目录 --asset-id 编号 [--asset-id 编号...]
@@ -119,6 +123,21 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     全库履历序号展示领用、退回的时间、工单、领用编号、备件、数量及说明或
     理由。领用、退回各为一次原子保存：校验、数量或编号容量不足、读写失败
     时保留原文件字节，不留下部分记录、不消耗编号，恢复后可重试。
+  - 附件索引只保存本地资料文件的引用（绝对路径），不复制、修改或删除文件。
+    attach 输入工单编号、文件路径与非空说明：未关闭、已关闭或已取消工单均可
+    补充资料；相对路径按调用时工作目录解析并保存绝对路径，登记时须为存在且
+    可读的普通文件。每次成功生成同目录唯一且不复用的附件编号（形如 A0001）
+    并输出；每次登记独立，同路径不合并，不使用报修请求标识去重。revoke 输入
+    附件编号与非空理由：成功显示已撤销，记录、路径、说明与理由全部保留；
+    未知编号、重复撤销拒绝；不影响同路径的其他索引或后来的工单。工单关闭或
+    取消不自动撤销附件；已撤销编号不能恢复，可重新登记为新索引。ticket 按
+    登记履历序号显示全部附件的编号、路径、说明和有效或已撤销状态，有效附件
+    另显示当前文件可读或不可用，无记录明确提示；文件日后消失、成为目录或
+    不可读仅使引用不可用，不阻止撤销及其他业务，也不参与整库一致性校验。
+    查询不写文件、不初始化目录。history 按全库履历序号展示附件登记、撤销
+    事件的时间、工单、附件编号、路径及说明或理由。登记、撤销各为一次原子
+    保存：校验、编号或履历容量不足、读写失败时保留原文件字节，不留下部分
+    记录、不消耗编号，恢复后可重试。
   - downtime 为只读统计，不写文件、不初始化目录、不追加履历。--start/--end 为
     带时区的 RFC3339 时刻（可含小数秒），起点须早于终点；窗口包含起点、不包含
     终点，按实际时刻比较。停机自工单报修履历时间起，至关闭或取消履历时间止
@@ -129,12 +148,15 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     时统计全部资产并按编号字典序排列，空库明确提示无记录并显示零合计。若所选
     资产任一终结工单的结束履历时间早于报修履历时间（即使该单在窗口外、结束
     等于开始合法），整次统计失败，指出资产与工单，不输出部分结果。
-  - import 把源数据目录中所选资产连同全部工单、报修请求绑定、履历、保养计划与
-    备件领用记录复制到目标目录（--data-dir）：源台账始终只读，同一台账不能导入
+  - import 把源数据目录中所选资产连同全部工单、报修请求绑定、履历、保养计划、
+    备件领用记录与附件索引（含已撤销，不复制文件本身）复制到目标目录
+    （--data-dir）：源台账始终只读，同一台账不能导入
     自身；重复编号按一项处理。工单编号按源工单序号升序从目标下一序号重新分配，
     履历与请求绑定中的工单引用同步替换；领用编号按源领用履历序号整体排序后从
-    目标下一序号重新分配并输出映射，退回履历中的领用引用同步更新；数量、时间
-    精度与操作顺序保持。
+    目标下一序号重新分配并输出映射，退回履历中的领用引用同步更新；附件编号按
+    源登记履历序号整体排序后从目标下一序号重新分配并输出映射，工单及附件引用
+    同步替换；数量、路径、状态、说明、理由、时间
+    精度与操作顺序保持，文件不可用不使导入失败。
     履历在目标最大履历序号之后按源序号顺序分配新序号，保留原操作顺序与原时间
     （含小数秒）。保养计划与保养履历原样复制，内容、日期及完成链接续，目标已有
     计划不变。资产编号在目标已存在、或所选工单的任一请求标识已在目标绑定时整批
@@ -202,6 +224,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdWithdraw(args[1:], stdout)
 	case "return":
 		err = cmdReturn(args[1:], stdout)
+	case "attach":
+		err = cmdAttach(args[1:], stdout)
+	case "revoke":
+		err = cmdRevoke(args[1:], stdout)
 	case "history":
 		err = cmdHistory(args[1:], stdout)
 	case "downtime":
@@ -495,16 +521,36 @@ func cmdTicket(args []string, w io.Writer) error {
 	parts := s.partsOf(t.ID)
 	if len(parts) == 0 {
 		fmt.Fprintln(w, "备件领用: 无")
+	} else {
+		fmt.Fprintf(w, "备件领用（共 %d 笔）:\n", len(parts))
+		for _, p := range parts {
+			fmt.Fprintf(w, "%s\t%s\t原数量 %d\t累计退回 %d\t净量 %d\n",
+				p.ID, p.PartID, p.Quantity, p.Returned, p.Quantity-p.Returned)
+		}
+		fmt.Fprintln(w, "备件净量汇总（按备件编号）:")
+		for _, r := range s.partNetSummary(t.ID) {
+			fmt.Fprintf(w, "%s\t净量 %s\n", r.PartID, r.Net.String())
+		}
+	}
+	// 附件索引：按登记履历的全库序号顺序显示全部附件（含已撤销）的编号、路径、
+	// 说明与状态；有效附件另显示当前文件可读或不可用。文件消失、成为目录或不
+	// 可读仅影响此处的可用性显示，不影响其他业务。只读，不写文件。
+	attachments := s.attachmentsOf(t.ID)
+	if len(attachments) == 0 {
+		fmt.Fprintln(w, "附件: 无")
 		return nil
 	}
-	fmt.Fprintf(w, "备件领用（共 %d 笔）:\n", len(parts))
-	for _, p := range parts {
-		fmt.Fprintf(w, "%s\t%s\t原数量 %d\t累计退回 %d\t净量 %d\n",
-			p.ID, p.PartID, p.Quantity, p.Returned, p.Quantity-p.Returned)
-	}
-	fmt.Fprintln(w, "备件净量汇总（按备件编号）:")
-	for _, r := range s.partNetSummary(t.ID) {
-		fmt.Fprintf(w, "%s\t净量 %s\n", r.PartID, r.Net.String())
+	fmt.Fprintf(w, "附件（共 %d 条）:\n", len(attachments))
+	for _, a := range attachments {
+		if a.Revoked {
+			fmt.Fprintf(w, "%s\t%s\t%s\t已撤销\n", a.ID, a.Path, a.Note)
+			continue
+		}
+		availability := "可读"
+		if !regularFileReadable(a.Path) {
+			availability = "不可用"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t有效\t%s\n", a.ID, a.Path, a.Note, availability)
 	}
 	return nil
 }
@@ -791,6 +837,83 @@ func cmdReturn(args []string, w io.Writer) error {
 	return nil
 }
 
+// cmdAttach 为工单登记本地资料文件的附件索引：只保存引用（绝对路径），不复制
+// 文件。未关闭、已关闭或已取消工单均可登记；成功输出同目录唯一且不复用的附件
+// 编号。缺参数为退出码 2；未知工单、文件不存在或不可读等业务失败为退出码 1。
+func cmdAttach(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var ticketID, path, note string
+	fs := newFlagSet("attach", &opts)
+	fs.StringVar(&ticketID, "ticket-id", "", "要登记附件的工单编号（必填；未关闭、已关闭或已取消工单均可）")
+	fs.StringVar(&path, "path", "", "本地文件路径（必填；相对路径按当前工作目录解析，保存绝对路径；须为存在且可读的普通文件）")
+	fs.StringVar(&note, "note", "", "附件说明（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, ticketID, "ticket-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, path, "path"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, note, "note"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	a, err := s.attachFile(ticketID, path, note)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "附件编号: %s\n", a.ID)
+	fmt.Fprintf(w, "工单编号: %s\n", a.TicketID)
+	fmt.Fprintf(w, "路径: %s\n", a.Path)
+	fmt.Fprintf(w, "说明: %s\n", a.Note)
+	return nil
+}
+
+// cmdRevoke 按附件编号撤销附件索引：记录、路径、说明与理由全部保留，状态变为
+// 已撤销。与工单状态、文件当前可用性无关；不影响同路径的其他索引。
+func cmdRevoke(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var attachmentID, reason string
+	fs := newFlagSet("revoke", &opts)
+	fs.StringVar(&attachmentID, "attachment-id", "", "要撤销的附件编号（必填）")
+	fs.StringVar(&reason, "reason", "", "撤销理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, attachmentID, "attachment-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	a, err := s.revokeAttachment(attachmentID, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "附件 %s 已撤销。\n", a.ID)
+	fmt.Fprintf(w, "工单编号: %s\n", a.TicketID)
+	fmt.Fprintf(w, "路径: %s\n", a.Path)
+	fmt.Fprintf(w, "撤销理由: %s\n", a.RevokeReason)
+	return nil
+}
+
 func cmdHistory(args []string, w io.Writer) error {
 	var opts cmdOptions
 	var id string
@@ -830,6 +953,9 @@ func cmdHistory(args []string, w io.Writer) error {
 		case eventPartWithdraw, eventPartReturn:
 			fmt.Fprintf(w, "[%s] %s 工单 %s: 领用编号 %s，备件 %s，数量 %d（%s）\n",
 				ts, e.Kind, e.TicketID, e.WithdrawalID, e.PartID, e.Quantity, e.Content)
+		case eventAttach, eventRevoke:
+			fmt.Fprintf(w, "[%s] %s 工单 %s: 附件编号 %s，路径 %s（%s）\n",
+				ts, e.Kind, e.TicketID, e.AttachmentID, e.Path, e.Content)
 		default:
 			fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n", ts, e.Kind, e.TicketID, e.Content)
 		}
