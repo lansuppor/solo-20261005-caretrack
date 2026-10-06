@@ -30,7 +30,9 @@ import (
 //     顺序（不按时间重排）；履历时间保留原瞬间与小数秒精度。导入本身不追加报修
 //     或其他业务事件。
 //   - 保养计划随资产原样复制（内容、首次到期日、间隔与下一到期日不变），保养履历
-//     随资产履历一并复制，完成链自然接续；目标已有计划不受影响。
+//     （含撤销履历）随资产履历一并复制，完成与撤销链自然接续，撤销引用随履历重编号
+//     同步替换，并输出保养完成履历序号的原、新映射；导入后可用新序号继续撤销。
+//     目标已有计划不受影响。
 //   - 资产编号在目标已存在，或所选工单的任一请求标识已在目标绑定时，整批拒绝：
 //     不覆盖、不合并、不改请求标识。
 //   - 操作前检查源、目标整库一致性，提交前由 save 再检查合并后的数据；整批变化
@@ -64,12 +66,19 @@ type attachRemap struct {
 	NewID string
 }
 
+// completionRemap 记录一条保养完成履历的原全库序号与新全库序号。
+type completionRemap struct {
+	OldSeq int
+	NewSeq int
+}
+
 // importOutcome 为一次成功导入的结果摘要，用于输出。
 type importOutcome struct {
 	assetIDs    []string
 	tickets     []ticketRemap
 	parts       []partRemap
 	attachments []attachRemap
+	completions []completionRemap
 	plans       int
 }
 
@@ -121,6 +130,12 @@ func cmdImport(args []string, w io.Writer) error {
 		fmt.Fprintln(w, "附件编号映射（原编号 -> 新编号）:")
 		for _, m := range outcome.attachments {
 			fmt.Fprintf(w, "%s -> %s\n", m.OldID, m.NewID)
+		}
+	}
+	if len(outcome.completions) > 0 {
+		fmt.Fprintln(w, "保养完成履历序号映射（原序号 -> 新序号）:")
+		for _, m := range outcome.completions {
+			fmt.Fprintf(w, "%d -> %d\n", m.OldSeq, m.NewSeq)
 		}
 	}
 	return nil
@@ -365,14 +380,27 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		nextAttach++
 	}
 	s.data.NextAttachSeq = nextAttach
+	// 先为全部导入履历分配新序号，再统一追加：保养撤销履历的目标完成引用
+	// 随重编号同步替换，保养完成履历的原、新序号映射随结果输出。
+	seqRemap := make(map[int]int, len(events))
 	seq := maxSeq
 	for _, e := range events {
 		seq++
+		seqRemap[e.Seq] = seq
+	}
+	for _, e := range events {
 		ne := e
-		ne.Seq = seq
+		ne.Seq = seqRemap[e.Seq]
 		ne.TicketID = remap[e.TicketID]
 		ne.WithdrawalID = partIDs[e.WithdrawalID]
 		ne.AttachmentID = attachIDs[e.AttachmentID]
+		if ne.Kind == eventPlanUndo {
+			ne.UndoSeq = seqRemap[e.UndoSeq]
+		}
+		if ne.Kind == eventPlanDone {
+			outcome.completions = append(outcome.completions,
+				completionRemap{OldSeq: e.Seq, NewSeq: ne.Seq})
+		}
 		s.data.Events = append(s.data.Events, ne)
 	}
 	return outcome, nil

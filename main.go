@@ -30,13 +30,14 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   close      关闭工单并填写维修结果，设备恢复“可用”
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
   plan       为资产建立唯一的周期保养计划（不可覆盖）
-  maintain   登记当前周期的保养完成，推进下一到期日
+  maintain   登记当前周期的保养完成，推进下一到期日并显示完成履历序号
+  unmaintain 撤销误登记的保养完成，恢复下一到期日为该完成的周期到期日
   due        按指定日期列出到期的保养计划（只读）
   withdraw   为未关闭工单领用备件，生成领用编号
   return     按领用编号退回备件（允许多次部分退回）
   attach     为工单登记本地资料附件索引（只保存引用，不复制文件）
   revoke     按附件编号撤销附件索引（保留记录、路径、说明与理由）
-  history    按资产查看履历（报修、派工、关闭、取消、保养建立与完成、备件领用与退回、附件登记与撤销事件）
+  history    按资产查看履历（报修、派工、关闭、取消、保养建立与完成及撤销、备件领用与退回、附件登记与撤销事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
   import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划、备件记录与附件索引（复制，源只读）
   help       显示本帮助
@@ -55,6 +56,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
            --interval-days 间隔天数                           [--data-dir 目录]
   maintain --asset-id 编号 --due 周期到期日 --done 实际完成日 --result 结果
                                                               [--data-dir 目录]
+  unmaintain --asset-id 编号 --seq 完成履历序号 --reason 理由  [--data-dir 目录]
   due      --date 日期                                        [--data-dir 目录]
   withdraw --ticket-id 工单编号 --part-id 备件编号 --quantity 数量 --note 说明
                                                               [--data-dir 目录]
@@ -100,14 +102,23 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     周期到期日，--result 结果非空；无计划时拒绝。成功后记录一次实际保养，下一到期
     日为首次到期日加整数倍间隔所得日期中严格晚于完成日的最早日期；延期跨过的
     周期不生成完成记录，也不改用完成日加间隔。若下一到期日超出 9999-12-31，整次
-    拒绝。输出完成周期与下一到期日。
+    拒绝。输出完成周期、本次完成履历的全库序号与下一到期日。
+  - unmaintain 撤销误登记的保养完成：--seq 为 maintain 成功时输出（或 history 中
+    查看）的完成履历全库序号，--reason 理由非空。仅可撤销该资产按序号最新的未撤销
+    完成；存在更晚有效完成、未知资产或序号、目标不是该资产的完成、重复撤销均失败。
+    成功后保留原完成的日期、结果与时间，追加一条含目标序号、理由与操作时间的撤销
+    履历，下一到期日恢复为该完成的周期到期日（延期跨过的周期不补记录），并输出
+    目标序号与恢复日期。撤销后可继续撤销此前最新有效完成；维修或其他资产事件不
+    阻止撤销。恢复周期可按原 maintain 规则重新完成，生成新序号；旧序号的再次撤销
+    仍拒绝，不会误撤销新登记。detail、due 随撤销反映回退后的下一到期日。
   - due 为只读查询：列出下一到期日不晚于 --date 的保养计划，显示资产编号、名称、
     保养内容和到期日，按到期日再按资产编号排序；无匹配明确提示。不写文件、不
     初始化目录、不推进计划。
   - 每个保养计划恰有一条含初始计划的建立履历，完成履历含周期到期日、实际完成日
-    和结果；保养履历与维修履历按全库唯一履历序号共同展示操作时间及内容。维修中
-    资产也可建立计划和登记完成：保养不创建或终结工单、不消耗工单编号，不改变
-    资产状态、请求绑定或停机统计。
+    和结果，撤销履历含目标完成序号与理由；保养履历与维修履历按全库唯一履历序号
+    共同展示操作时间及内容，history 中各次完成显示其履历序号及有效或已撤销状态。
+    维修中资产也可建立计划、登记完成与撤销：保养不创建或终结工单、不消耗工单
+    编号，不改变资产状态、请求绑定或停机统计。
   - 备件领用与退回台账：仅未关闭工单可领用，备件编号与说明非空、数量为正整数
     （表示工单用量）；每次成功生成同目录唯一且不复用的领用编号（形如 P0001）
     并输出，同备件多次领用各自独立，领用编号用于定位记录，不用报修请求标识
@@ -157,8 +168,9 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     同步替换，路径、状态、说明与理由保持，不复制资料文件，文件不可用不使导入
     失败；数量、时间精度与操作顺序保持。
     履历在目标最大履历序号之后按源序号顺序分配新序号，保留原操作顺序与原时间
-    （含小数秒）。保养计划与保养履历原样复制，内容、日期及完成链接续，目标已有
-    计划不变。资产编号在目标已存在、或所选工单的任一请求标识已在目标绑定时整批
+    （含小数秒）。保养计划与保养履历（含撤销履历）原样复制，内容、日期、撤销状态
+    及完成链接续，撤销引用随履历重编号同步替换，并输出保养完成履历序号的原、新
+    映射；导入后可用新序号继续撤销。目标已有计划不变。资产编号在目标已存在、或所选工单的任一请求标识已在目标绑定时整批
     拒绝，不覆盖、不合并。导入后可用原请求标识、资产与描述重放报修，返回映射后
     的工单及其当前状态；再次导入同一批资产按编号冲突拒绝。任何失败（源不存在、
     资产不存在、台账损坏、编号或履历序号容量不足、读写失败）都整批失败，两边
@@ -217,6 +229,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdPlan(args[1:], stdout)
 	case "maintain":
 		err = cmdMaintain(args[1:], stdout)
+	case "unmaintain":
+		err = cmdUnmaintain(args[1:], stdout)
 	case "due":
 		err = cmdDue(args[1:], stdout)
 	case "withdraw":
@@ -700,7 +714,7 @@ func cmdMaintain(args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	p, next, err := s.completePlan(assetID, due, done, result)
+	p, next, seq, err := s.completePlan(assetID, due, done, result)
 	if err != nil {
 		return err
 	}
@@ -709,7 +723,47 @@ func cmdMaintain(args []string, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "资产 %s 已完成周期 %s 的保养。\n", p.AssetID, due)
 	fmt.Fprintf(w, "实际完成日: %s\n", done)
+	fmt.Fprintf(w, "完成履历序号: %d\n", seq)
 	fmt.Fprintf(w, "下一到期日: %s\n", next)
+	return nil
+}
+
+// cmdUnmaintain 撤销误登记的保养完成：仅可撤销该资产按序号最新的未撤销完成，
+// 成功后下一到期日恢复为该完成的周期到期日，并输出目标序号与恢复日期。
+func cmdUnmaintain(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var assetID, reason string
+	var seq int
+	fs := newFlagSet("unmaintain", &opts)
+	fs.StringVar(&assetID, "asset-id", "", "企业资产编号（必填）")
+	fs.IntVar(&seq, "seq", 0, "要撤销的保养完成履历序号（必填，正整数；maintain 成功时输出，history 可查）")
+	fs.StringVar(&reason, "reason", "", "撤销理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, assetID, "asset-id"); err != nil {
+		return err
+	}
+	if seq < 1 {
+		return &usageError{msg: "--seq 须为正整数"}
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	p, restored, err := s.undoCompletion(assetID, seq, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "已撤销资产 %s 的保养完成履历（序号 %d）。\n", p.AssetID, seq)
+	fmt.Fprintf(w, "恢复下一到期日: %s\n", restored)
 	return nil
 }
 
@@ -938,6 +992,7 @@ func cmdHistory(args []string, w io.Writer) error {
 		return nil
 	}
 	fmt.Fprintf(w, "资产 %s 维修履历（共 %d 条）:\n", id, len(events))
+	undone := s.undoneMaintSeqs()
 	for _, e := range events {
 		ts := e.Time.Format("2006-01-02T15:04:05Z07:00")
 		switch e.Kind {
@@ -948,8 +1003,15 @@ func cmdHistory(args []string, w io.Writer) error {
 			fmt.Fprintf(w, "[%s] %s: %s（首次到期日 %s，每 %d 天）\n",
 				ts, e.Kind, e.Content, e.Due, e.Interval)
 		case eventPlanDone:
-			fmt.Fprintf(w, "[%s] %s: 周期到期日 %s，实际完成日 %s，%s\n",
-				ts, e.Kind, e.Due, e.Done, e.Content)
+			status := "有效"
+			if undone[e.Seq] {
+				status = "已撤销"
+			}
+			fmt.Fprintf(w, "[%s] %s（履历序号 %d，%s）: 周期到期日 %s，实际完成日 %s，%s\n",
+				ts, e.Kind, e.Seq, status, e.Due, e.Done, e.Content)
+		case eventPlanUndo:
+			fmt.Fprintf(w, "[%s] %s（履历序号 %d）: 撤销保养完成履历序号 %d（%s）\n",
+				ts, e.Kind, e.Seq, e.UndoSeq, e.Content)
 		case eventPartWithdraw, eventPartReturn:
 			fmt.Fprintf(w, "[%s] %s 工单 %s: 领用编号 %s，备件 %s，数量 %d（%s）\n",
 				ts, e.Kind, e.TicketID, e.WithdrawalID, e.PartID, e.Quantity, e.Content)
