@@ -95,7 +95,8 @@ func TestPartWithdrawAndPartialReturns(t *testing.T) {
 
 	// 汇总：FILTER-01 净量 (5-4)+(3-1)+1 = 4，ROLLER-02 净量 2。
 	rows := s2.partNetSummary("T0001")
-	if len(rows) != 2 || rows[0] != (partNetRow{"FILTER-01", 4}) || rows[1] != (partNetRow{"ROLLER-02", 2}) {
+	if len(rows) != 2 || rows[0].PartID != "FILTER-01" || rows[0].Net.String() != "4" ||
+		rows[1].PartID != "ROLLER-02" || rows[1].Net.String() != "2" {
 		t.Fatalf("净量汇总应按备件编号字典序，得到 %+v", rows)
 	}
 }
@@ -136,7 +137,7 @@ func TestPartTerminalStateKeepsRecords(t *testing.T) {
 	if err != nil || p2.ID != "P0002" {
 		t.Fatalf("新工单领用: %v %+v", err, p2)
 	}
-	if got := s.partNetSummary("T0002"); len(got) != 1 || got[0] != (partNetRow{"FILTER-01", 2}) {
+	if got := s.partNetSummary("T0002"); len(got) != 1 || got[0].PartID != "FILTER-01" || got[0].Net.String() != "2" {
 		t.Fatalf("新单汇总应独立于旧单，得到 %+v", got)
 	}
 	mustSave(t, s)

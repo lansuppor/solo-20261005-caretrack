@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 )
 
@@ -31,29 +32,52 @@ func (s *store) findPart(id string) *PartWithdrawal {
 	return nil
 }
 
-// partsOf 按领用顺序返回工单的全部领用记录（追加顺序即领用顺序）。
+// withdrawSeqs 返回每笔领用编号对应的领用履历全库序号。领用编号只用于定位
+// 记录：各笔领用的先后由该笔唯一领用履历的序号决定，与记录数组位置、编号
+// 大小及履历时间无关（有效台账允许数组乱序、序号间隔、时间不递增以及编号
+// 大小与领用先后不一致）。
+func (s *store) withdrawSeqs() map[string]int {
+	seqs := make(map[string]int, len(s.data.Parts))
+	for _, e := range s.data.Events {
+		if e.Kind == eventPartWithdraw {
+			seqs[e.WithdrawalID] = e.Seq
+		}
+	}
+	return seqs
+}
+
+// partsOf 按领用先后返回工单的全部领用记录：顺序由每笔唯一领用履历的全库
+// 序号决定，不使用数组位置或编号大小。
 func (s *store) partsOf(ticketID string) []*PartWithdrawal {
+	seqs := s.withdrawSeqs()
 	out := make([]*PartWithdrawal, 0)
 	for _, p := range s.data.Parts {
 		if p.TicketID == ticketID {
 			out = append(out, p)
 		}
 	}
+	sort.SliceStable(out, func(i, j int) bool { return seqs[out[i].ID] < seqs[out[j].ID] })
 	return out
 }
 
-// partNetRow 为按备件编号汇总的一行净量。
+// partNetRow 为按备件编号汇总的一行净量。Net 为精确十进制整数：同备件多笔
+// 净量之和可能超出单笔数量范围，汇总不得回绕或截断，也不因此拒绝合法台账。
 type partNetRow struct {
 	PartID string
-	Net    int
+	Net    *big.Int
 }
 
 // partNetSummary 按备件编号字典序汇总工单各笔领用的净量；全部退回的备件
 // 净量为零仍显示。
 func (s *store) partNetSummary(ticketID string) []partNetRow {
-	nets := map[string]int{}
+	nets := map[string]*big.Int{}
 	for _, p := range s.partsOf(ticketID) {
-		nets[p.PartID] += p.Quantity - p.Returned
+		acc := nets[p.PartID]
+		if acc == nil {
+			acc = new(big.Int)
+			nets[p.PartID] = acc
+		}
+		acc.Add(acc, big.NewInt(int64(p.Quantity-p.Returned)))
 	}
 	rows := make([]partNetRow, 0, len(nets))
 	for partID, net := range nets {
@@ -149,9 +173,12 @@ func (s *store) returnPart(withdrawalID string, quantity int, reason string) (*P
 	if quantity < 1 {
 		return nil, nil, fmt.Errorf("%w: 退回数量须为正整数", errConflict)
 	}
-	if p.Returned+quantity > p.Quantity {
+	// 剩余可退数量 = 原数量 - 累计退回（两者均在 [0, 原数量] 内，减法不会溢出）；
+	// 退回数量超过剩余即拒绝。不做 Returned+quantity 的加法比较：大数量相加
+	// 可能整数溢出回绕成负数，从而错误接受超额退回。
+	if quantity > p.Quantity-p.Returned {
 		return nil, nil, fmt.Errorf(
-			"%w: 领用记录 %s 原数量 %d，已退回 %d，再退 %d 将超过原数量",
+			"%w: 备件数量问题：领用记录 %s 原数量 %d，已退回 %d，再退 %d 将超过原数量",
 			errConflict, p.ID, p.Quantity, p.Returned, quantity)
 	}
 	eventSeq, err := s.nextEventSeq()
