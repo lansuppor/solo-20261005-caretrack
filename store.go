@@ -372,10 +372,10 @@ func validateData(d *storeData) error {
 			maxPartSeq = n
 		}
 		if p.Quantity < 1 {
-			return fmt.Errorf("数据矛盾：领用记录 %s 的数量 %d 不是正整数", p.ID, p.Quantity)
+			return fmt.Errorf("备件数量问题：领用记录 %s 的数量 %d 不是正整数", p.ID, p.Quantity)
 		}
 		if p.Returned < 0 || p.Returned > p.Quantity {
-			return fmt.Errorf("数据矛盾：领用记录 %s 的累计退回 %d 超出原数量 %d", p.ID, p.Returned, p.Quantity)
+			return fmt.Errorf("备件数量问题：领用记录 %s 的累计退回 %d 超出原数量 %d", p.ID, p.Returned, p.Quantity)
 		}
 		t := tickets[p.TicketID]
 		if t == nil {
@@ -551,7 +551,7 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录缺少备件编号或领用编号", e.Seq, e.Kind)
 			}
 			if e.Quantity < 1 {
-				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录数量 %d 不是正整数", e.Seq, e.Kind, e.Quantity)
+				return fmt.Errorf("备件数量问题：履历序号 %d 的%s记录数量 %d 不是正整数", e.Seq, e.Kind, e.Quantity)
 			}
 			if _, ok := parsePartSeq(e.WithdrawalID); !ok {
 				return fmt.Errorf("履历矛盾：履历序号 %d 的领用编号 %q 不是 P 加补零正整数序号的形式",
@@ -673,11 +673,13 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：退回履历（序号 %d）与领用记录 %s 的工单、资产或备件不一致",
 					e.Seq, p.ID)
 			}
-			derivedReturned[p.ID] += e.Quantity
-			if derivedReturned[p.ID] > p.Quantity {
-				return fmt.Errorf("履历矛盾：领用记录 %s 的累计退回 %d 超过原数量 %d",
-					p.ID, derivedReturned[p.ID], p.Quantity)
+			// 用减法比较避免整数溢出：即使回绕后的累计恰好等于保存值，
+			// 实际超额的履历也必须在此拒绝。
+			if e.Quantity > p.Quantity-derivedReturned[p.ID] {
+				return fmt.Errorf("备件数量问题：领用记录 %s 的累计退回超过原数量 %d（退回履历序号 %d）",
+					p.ID, p.Quantity, e.Seq)
 			}
+			derivedReturned[p.ID] += e.Quantity
 		}
 	}
 	for _, t := range d.Tickets {
@@ -700,7 +702,7 @@ func validateData(d *storeData) error {
 			return fmt.Errorf("履历矛盾：领用记录 %s 缺少对应的领用履历", p.ID)
 		}
 		if derivedReturned[p.ID] != p.Returned {
-			return fmt.Errorf("数据矛盾：按履历推出领用记录 %s 的累计退回为 %d，与保存的 %d 不符",
+			return fmt.Errorf("备件数量问题：按履历推出领用记录 %s 的累计退回为 %d，与保存的 %d 不符",
 				p.ID, derivedReturned[p.ID], p.Returned)
 		}
 	}

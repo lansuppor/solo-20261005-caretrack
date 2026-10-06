@@ -6,9 +6,19 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+// netRowsText 把汇总行转为“备件=净量”文本列表，便于比较（净量为任意精度十进制）。
+func netRowsText(rows []partNetRow) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.PartID + "=" + r.Net.String()
+	}
+	return out
+}
 
 // newPartStore 建立含一项资产与一张未关闭工单 T0001 的测试台账。
 func newPartStore(t *testing.T) (*store, string) {
@@ -95,8 +105,8 @@ func TestPartWithdrawAndPartialReturns(t *testing.T) {
 
 	// 汇总：FILTER-01 净量 (5-4)+(3-1)+1 = 4，ROLLER-02 净量 2。
 	rows := s2.partNetSummary("T0001")
-	if len(rows) != 2 || rows[0] != (partNetRow{"FILTER-01", 4}) || rows[1] != (partNetRow{"ROLLER-02", 2}) {
-		t.Fatalf("净量汇总应按备件编号字典序，得到 %+v", rows)
+	if got := netRowsText(rows); !reflect.DeepEqual(got, []string{"FILTER-01=4", "ROLLER-02=2"}) {
+		t.Fatalf("净量汇总应按备件编号字典序，得到 %v", got)
 	}
 }
 
@@ -136,8 +146,8 @@ func TestPartTerminalStateKeepsRecords(t *testing.T) {
 	if err != nil || p2.ID != "P0002" {
 		t.Fatalf("新工单领用: %v %+v", err, p2)
 	}
-	if got := s.partNetSummary("T0002"); len(got) != 1 || got[0] != (partNetRow{"FILTER-01", 2}) {
-		t.Fatalf("新单汇总应独立于旧单，得到 %+v", got)
+	if got := netRowsText(s.partNetSummary("T0002")); !reflect.DeepEqual(got, []string{"FILTER-01=2"}) {
+		t.Fatalf("新单汇总应独立于旧单，得到 %v", got)
 	}
 	mustSave(t, s)
 

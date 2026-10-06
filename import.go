@@ -19,9 +19,10 @@ import (
 //   - 导入是复制：源台账始终只读，不删除、不修改任何源记录；同一台账不能导入自身。
 //   - 工单编号按源工单序号升序，从目标的下一工单序号重新分配，并同步替换履历与
 //     请求绑定中的工单引用；目标原有记录不改编号、不改变业务含义。
-//   - 备件领用编号按源领用顺序（领用序号升序），从目标的下一领用序号重新分配并
-//     输出映射；领用记录的工单引用与退回履历中的领用引用同步替换，数量、累计退回
-//     与净量保持。导入的未关闭工单可继续退回。
+//   - 备件领用编号按源领用履历的全库序号整体升序（跨工单统一排序，与编号大小
+//     无关），从目标的下一领用序号重新分配并输出映射；领用记录的工单引用与退回
+//     履历中的领用引用同步替换，数量、累计退回与净量保持。导入的未关闭工单可
+//     继续退回。
 //   - 履历按源履历序号排列，在目标已有最大履历序号之后依次分配新序号，保留原操作
 //     顺序（不按时间重排）；履历时间保留原瞬间与小数秒精度。导入本身不追加报修
 //     或其他业务事件。
@@ -232,10 +233,18 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 			"%w: 目标履历序号容量不足：当前最大序号 %d 无法容纳 %d 条导入履历，整批拒绝导入",
 			errConflict, maxSeq, len(events))
 	}
-	// 所选工单的全部备件领用记录，按源领用序号升序重新分配领用编号。
+	// 所选工单的全部备件领用记录，按源领用履历的全库序号整体升序（跨工单统一
+	// 排序；领用编号只定位记录，先后与编号大小无关），从目标下一领用序号依次
+	// 重新分配。
 	srcTicketIDs := map[string]bool{}
 	for _, t := range tickets {
 		srcTicketIDs[t.ID] = true
+	}
+	srcWithdrawSeq := map[string]int{}
+	for _, e := range src.data.Events {
+		if e.Kind == eventPartWithdraw {
+			srcWithdrawSeq[e.WithdrawalID] = e.Seq
+		}
 	}
 	parts := make([]*PartWithdrawal, 0)
 	for _, p := range src.data.Parts {
@@ -244,9 +253,7 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		}
 	}
 	sort.SliceStable(parts, func(i, j int) bool {
-		ni, _ := parsePartSeq(parts[i].ID)
-		nj, _ := parsePartSeq(parts[j].ID)
-		return ni < nj
+		return srcWithdrawSeq[parts[i].ID] < srcWithdrawSeq[parts[j].ID]
 	})
 	// 领用编号容量：与 withdrawPart 同一约束，可分配的最大序号为 math.MaxInt-1。
 	if len(parts) > math.MaxInt-s.data.NextPartSeq {
