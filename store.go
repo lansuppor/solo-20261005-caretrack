@@ -30,6 +30,9 @@ const (
 	eventPlanCreate = "保养建立"
 	eventPlanDone   = "保养完成"
 
+	eventPartWithdraw = "领用"
+	eventPartReturn   = "退回"
+
 	storeVersion = 1
 	dataFileName = "caretrack.json"
 )
@@ -65,37 +68,45 @@ type Ticket struct {
 	AssignNote   string `json:"assign_note,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消/保养建立/保养完成），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/派工/关闭/取消/保养建立/保养完成/领用/退回），Seq 决定操作发生顺序。
 // From/To 仅派工履历使用：原负责人（首次派工为空，展示为“未派工”）与新负责人。
 // Due/Done/Interval 仅保养履历使用：建立履历含首次到期日（Due）与间隔天数
 // （Interval），完成履历含周期到期日（Due）与实际完成日（Done）。
+// PartID/Quantity/WithdrawalID 仅备件履历使用：领用与退回履历都携带备件编号、
+// 数量与所属领用编号；Content 分别为领用说明与退回理由。
 type Event struct {
-	Seq      int       `json:"-"`
-	AssetID  string    `json:"-"`
-	TicketID string    `json:"-"`
-	Kind     string    `json:"-"`
-	Content  string    `json:"-"`
-	From     string    `json:"-"`
-	To       string    `json:"-"`
-	Due      string    `json:"-"`
-	Done     string    `json:"-"`
-	Interval int       `json:"-"`
-	Time     time.Time `json:"-"`
+	Seq          int       `json:"-"`
+	AssetID      string    `json:"-"`
+	TicketID     string    `json:"-"`
+	Kind         string    `json:"-"`
+	Content      string    `json:"-"`
+	From         string    `json:"-"`
+	To           string    `json:"-"`
+	Due          string    `json:"-"`
+	Done         string    `json:"-"`
+	Interval     int       `json:"-"`
+	PartID       string    `json:"-"`
+	Quantity     int       `json:"-"`
+	WithdrawalID string    `json:"-"`
+	Time         time.Time `json:"-"`
 }
 
 // eventJSON 与 Event 对应，时间以 RFC3339 文本持久化。
 type eventJSON struct {
-	Seq      int    `json:"seq"`
-	AssetID  string `json:"asset_id"`
-	TicketID string `json:"ticket_id,omitempty"`
-	Kind     string `json:"kind"`
-	Content  string `json:"content"`
-	From     string `json:"from,omitempty"`
-	To       string `json:"to,omitempty"`
-	Due      string `json:"due,omitempty"`
-	Done     string `json:"done,omitempty"`
-	Interval int    `json:"interval,omitempty"`
-	Time     string `json:"time"`
+	Seq          int    `json:"seq"`
+	AssetID      string `json:"asset_id"`
+	TicketID     string `json:"ticket_id,omitempty"`
+	Kind         string `json:"kind"`
+	Content      string `json:"content"`
+	From         string `json:"from,omitempty"`
+	To           string `json:"to,omitempty"`
+	Due          string `json:"due,omitempty"`
+	Done         string `json:"done,omitempty"`
+	Interval     int    `json:"interval,omitempty"`
+	PartID       string `json:"part_id,omitempty"`
+	Quantity     int    `json:"quantity,omitempty"`
+	WithdrawalID string `json:"withdrawal_id,omitempty"`
+	Time         string `json:"time"`
 }
 
 func (e Event) toJSON() eventJSON {
@@ -103,6 +114,7 @@ func (e Event) toJSON() eventJSON {
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
 		Due: e.Due, Done: e.Done, Interval: e.Interval,
+		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
 		// RFC3339Nano 保留小数秒精度；整秒时输出与 RFC3339 完全一致，
 		// 因此既有整秒台账的字节表示不变，而旧库中带小数秒的履历时间
 		// 在重新保存（含导入合并后的提交）时也不会被截断。
@@ -118,8 +130,23 @@ func (e eventJSON) toEvent() (Event, error) {
 	return Event{
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
-		Due: e.Due, Done: e.Done, Interval: e.Interval, Time: t,
+		Due: e.Due, Done: e.Done, Interval: e.Interval,
+		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
+		Time: t,
 	}, nil
+}
+
+// PartWithdrawal 为一笔备件领用记录，ID 即领用编号（同目录唯一、不复用）。
+// 数量表示工单用量；Returned 为累计退回数量，净量 = Quantity - Returned。
+// 工单关闭或取消后记录与净量保留，不清零。
+type PartWithdrawal struct {
+	ID       string `json:"id"`
+	TicketID string `json:"ticket_id"`
+	AssetID  string `json:"asset_id"`
+	PartID   string `json:"part_id"`
+	Quantity int    `json:"quantity"`
+	Note     string `json:"note"`
+	Returned int    `json:"returned"`
 }
 
 // requestBinding 记录请求标识与具体报修的绑定，用于去重与冲突拒绝；
@@ -133,14 +160,16 @@ type requestBinding struct {
 
 // storeData 是一次成功写操作共同生效的完整业务数据。
 type storeData struct {
-	Version       int              `json:"version"`
-	Assets        []*Asset         `json:"assets"`
-	Tickets       []*Ticket        `json:"tickets"`
-	Events        []Event          `json:"-"`
-	EventsJSON    []eventJSON      `json:"events"`
-	Requests      []requestBinding `json:"requests"`
-	Plans         []*Plan          `json:"plans"`
-	NextTicketSeq int              `json:"next_ticket_seq"`
+	Version       int               `json:"version"`
+	Assets        []*Asset          `json:"assets"`
+	Tickets       []*Ticket         `json:"tickets"`
+	Events        []Event           `json:"-"`
+	EventsJSON    []eventJSON       `json:"events"`
+	Requests      []requestBinding  `json:"requests"`
+	Plans         []*Plan           `json:"plans"`
+	Parts         []*PartWithdrawal `json:"parts"`
+	NextTicketSeq int               `json:"next_ticket_seq"`
+	NextPartSeq   int               `json:"next_part_seq"`
 }
 
 type store struct {
@@ -158,7 +187,9 @@ func newStoreData() *storeData {
 		EventsJSON:    []eventJSON{},
 		Requests:      []requestBinding{},
 		Plans:         []*Plan{},
+		Parts:         []*PartWithdrawal{},
 		NextTicketSeq: 1,
+		NextPartSeq:   1,
 	}
 }
 
@@ -207,6 +238,14 @@ func loadStore(dir string, allowMissing bool) (*store, error) {
 	if d.Plans == nil {
 		d.Plans = []*Plan{}
 	}
+	// 无备件字段的有效旧库直接使用：缺省视为没有任何备件领用记录，
+	// 领用编号计数器从 1 开始。
+	if d.Parts == nil {
+		d.Parts = []*PartWithdrawal{}
+	}
+	if d.NextPartSeq == 0 && len(d.Parts) == 0 {
+		d.NextPartSeq = 1
+	}
 	if err := validateData(&d); err != nil {
 		return nil, fmt.Errorf("数据文件 %s 内容相互矛盾：%w（原文件已保留，未做任何修改）", path, err)
 	}
@@ -229,6 +268,22 @@ func parseTicketSeq(id string) (int, bool) {
 	return n, true
 }
 
+// parsePartSeq 解析 P 加补零正整数序号形式的领用编号，返回序号。
+// 编号必须与 fmt.Sprintf("P%04d", n)（n ≥ 1）完全一致，否则视为非法。
+func parsePartSeq(id string) (int, bool) {
+	if !strings.HasPrefix(id, "P") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(id[1:])
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	if fmt.Sprintf("P%04d", n) != id {
+		return 0, false
+	}
+	return n, true
+}
+
 // validateData 校验整份业务数据的内部一致性。任何矛盾都会返回指明问题类别
 // （计数器/请求绑定/状态/履历）的错误；调用方必须拒绝查询与写入并保留原文件。
 // 不做任何修复：不补字段、不重编号、不删除记录。
@@ -236,7 +291,7 @@ func validateData(d *storeData) error {
 	if d.Version != storeVersion {
 		return fmt.Errorf("不支持的数据版本 %d", d.Version)
 	}
-	if d.Assets == nil || d.Tickets == nil || d.Requests == nil || d.EventsJSON == nil || d.Events == nil || d.Plans == nil {
+	if d.Assets == nil || d.Tickets == nil || d.Requests == nil || d.EventsJSON == nil || d.Events == nil || d.Plans == nil || d.Parts == nil {
 		return errors.New("缺少必要的数据段")
 	}
 	assets := map[string]*Asset{}
@@ -299,6 +354,46 @@ func validateData(d *storeData) error {
 	if d.NextTicketSeq < 1 || d.NextTicketSeq <= maxTicketSeq {
 		return fmt.Errorf("计数器矛盾：下一工单序号 %d 必须为正并大于全部已用序号（当前最大 %d）",
 			d.NextTicketSeq, maxTicketSeq)
+	}
+	// 备件领用记录：编号唯一且为 P 加补零正整数序号，归属存在的工单且资产归属
+	// 与工单一致，数量为正，累计退回在 [0, 原数量] 内；与履历的接续在下方按
+	// 履历序号重放时核对。
+	parts := map[string]*PartWithdrawal{}
+	maxPartSeq := 0
+	for _, p := range d.Parts {
+		if p == nil || p.ID == "" || p.TicketID == "" || p.AssetID == "" || p.PartID == "" || p.Note == "" {
+			return errors.New("数据矛盾：存在字段不完整的备件领用记录")
+		}
+		n, ok := parsePartSeq(p.ID)
+		if !ok {
+			return fmt.Errorf("计数器矛盾：领用编号 %q 不是 P 加补零正整数序号的形式", p.ID)
+		}
+		if n > maxPartSeq {
+			maxPartSeq = n
+		}
+		if p.Quantity < 1 {
+			return fmt.Errorf("数据矛盾：领用记录 %s 的数量 %d 不是正整数", p.ID, p.Quantity)
+		}
+		if p.Returned < 0 || p.Returned > p.Quantity {
+			return fmt.Errorf("数据矛盾：领用记录 %s 的累计退回 %d 超出原数量 %d", p.ID, p.Returned, p.Quantity)
+		}
+		t := tickets[p.TicketID]
+		if t == nil {
+			return fmt.Errorf("数据矛盾：领用记录 %s 引用了不存在的工单 %s", p.ID, p.TicketID)
+		}
+		if t.AssetID != p.AssetID {
+			return fmt.Errorf("数据矛盾：领用记录 %s 的资产 %s 与工单 %s 归属的资产 %s 不一致",
+				p.ID, p.AssetID, t.ID, t.AssetID)
+		}
+		if parts[p.ID] != nil {
+			return fmt.Errorf("数据矛盾：领用编号 %s 重复", p.ID)
+		}
+		parts[p.ID] = p
+	}
+	// 下一领用序号必须为正并大于全部已用序号（允许有间隔）。
+	if d.NextPartSeq < 1 || d.NextPartSeq <= maxPartSeq {
+		return fmt.Errorf("计数器矛盾：下一领用序号 %d 必须为正并大于全部已用序号（当前最大 %d）",
+			d.NextPartSeq, maxPartSeq)
 	}
 	// 请求绑定：每张工单恰有一条绑定，且请求标识、资产、描述、工单编号完全一致。
 	boundReq := map[string]bool{}
@@ -449,6 +544,19 @@ func validateData(d *storeData) error {
 		case eventAssign:
 			// 内容即派工说明（非空已检查）；派工链的接续与工单负责人一致性
 			// 在下方按序号重放时核对。
+		case eventPartWithdraw, eventPartReturn:
+			// 内容即领用说明或退回理由（非空已检查）；备件字段在此核对，
+			// 与领用记录的接续及累计退回在下方按序号重放时核对。
+			if e.PartID == "" || e.WithdrawalID == "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录缺少备件编号或领用编号", e.Seq, e.Kind)
+			}
+			if e.Quantity < 1 {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录数量 %d 不是正整数", e.Seq, e.Kind, e.Quantity)
+			}
+			if _, ok := parsePartSeq(e.WithdrawalID); !ok {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的领用编号 %q 不是 P 加补零正整数序号的形式",
+					e.Seq, e.WithdrawalID)
+			}
 		default:
 			return fmt.Errorf("履历矛盾：履历序号 %d 的事件类型无效 %q", e.Seq, e.Kind)
 		}
@@ -489,6 +597,8 @@ func validateData(d *storeData) error {
 	derivedOpen := map[string]string{}
 	derivedAssignee := map[string]string{}
 	derivedNote := map[string]string{}
+	withdrawSeq := map[string]int{}
+	derivedReturned := map[string]int{}
 	for _, e := range sorted {
 		switch e.Kind {
 		case eventReport:
@@ -523,6 +633,51 @@ func validateData(d *storeData) error {
 			}
 			derivedTicket[e.TicketID] = ticketCancelled
 			delete(derivedOpen, e.AssetID)
+		case eventPartWithdraw:
+			// 领用须在报修之后、终结之前；履历与领用记录的业务字段必须一致。
+			if derivedTicket[e.TicketID] != ticketOpen {
+				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现领用履历（序号 %d）",
+					e.TicketID, e.Seq)
+			}
+			p := parts[e.WithdrawalID]
+			if p == nil {
+				return fmt.Errorf("履历矛盾：领用履历（序号 %d）引用了不存在的领用记录 %s",
+					e.Seq, e.WithdrawalID)
+			}
+			if withdrawSeq[p.ID] != 0 {
+				return fmt.Errorf("履历矛盾：领用记录 %s 有多条领用履历", p.ID)
+			}
+			if p.TicketID != e.TicketID || p.AssetID != e.AssetID || p.PartID != e.PartID ||
+				p.Quantity != e.Quantity || p.Note != e.Content {
+				return fmt.Errorf("履历矛盾：领用履历（序号 %d）与领用记录 %s 的工单、资产、备件、数量或说明不一致",
+					e.Seq, p.ID)
+			}
+			withdrawSeq[p.ID] = e.Seq
+		case eventPartReturn:
+			// 退回须在报修之后、终结之前，且指向先前已领用的记录；
+			// 累计退回不得超过该笔原数量。
+			if derivedTicket[e.TicketID] != ticketOpen {
+				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现退回履历（序号 %d）",
+					e.TicketID, e.Seq)
+			}
+			p := parts[e.WithdrawalID]
+			if p == nil {
+				return fmt.Errorf("履历矛盾：退回履历（序号 %d）引用了不存在的领用记录 %s",
+					e.Seq, e.WithdrawalID)
+			}
+			if withdrawSeq[p.ID] == 0 {
+				return fmt.Errorf("履历矛盾：退回履历（序号 %d）出现在领用记录 %s 的领用履历之前",
+					e.Seq, p.ID)
+			}
+			if p.TicketID != e.TicketID || p.AssetID != e.AssetID || p.PartID != e.PartID {
+				return fmt.Errorf("履历矛盾：退回履历（序号 %d）与领用记录 %s 的工单、资产或备件不一致",
+					e.Seq, p.ID)
+			}
+			derivedReturned[p.ID] += e.Quantity
+			if derivedReturned[p.ID] > p.Quantity {
+				return fmt.Errorf("履历矛盾：领用记录 %s 的累计退回 %d 超过原数量 %d",
+					p.ID, derivedReturned[p.ID], p.Quantity)
+			}
 		}
 	}
 	for _, t := range d.Tickets {
@@ -537,6 +692,16 @@ func validateData(d *storeData) error {
 		}
 		if t.Assignee != "" && derivedNote[t.ID] != t.AssignNote {
 			return fmt.Errorf("状态矛盾：工单 %s 保存的派工说明与最后一次派工履历不一致", t.ID)
+		}
+	}
+	// 每笔领用记录恰有一条领用履历；按履历重放得到的累计退回须与保存值一致。
+	for _, p := range d.Parts {
+		if withdrawSeq[p.ID] == 0 {
+			return fmt.Errorf("履历矛盾：领用记录 %s 缺少对应的领用履历", p.ID)
+		}
+		if derivedReturned[p.ID] != p.Returned {
+			return fmt.Errorf("数据矛盾：按履历推出领用记录 %s 的累计退回为 %d，与保存的 %d 不符",
+				p.ID, derivedReturned[p.ID], p.Returned)
 		}
 	}
 	for _, a := range d.Assets {

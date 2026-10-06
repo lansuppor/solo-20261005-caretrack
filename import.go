@@ -12,12 +12,16 @@ import (
 )
 
 // 资产批量导入：把源数据目录中所选资产连同其全部工单、报修请求绑定、
-// 报修/派工/关闭/取消履历与保养计划（含保养建立/完成履历）复制到目标数据目录。
+// 报修/派工/关闭/取消履历、备件领用记录与保养计划（含保养建立/完成履历）
+// 复制到目标数据目录。
 //
 // 关键规则：
 //   - 导入是复制：源台账始终只读，不删除、不修改任何源记录；同一台账不能导入自身。
 //   - 工单编号按源工单序号升序，从目标的下一工单序号重新分配，并同步替换履历与
 //     请求绑定中的工单引用；目标原有记录不改编号、不改变业务含义。
+//   - 备件领用编号按源领用顺序（领用序号升序），从目标的下一领用序号重新分配并
+//     输出映射；领用记录的工单引用与退回履历中的领用引用同步替换，数量、累计退回
+//     与净量保持。导入的未关闭工单可继续退回。
 //   - 履历按源履历序号排列，在目标已有最大履历序号之后依次分配新序号，保留原操作
 //     顺序（不按时间重排）；履历时间保留原瞬间与小数秒精度。导入本身不追加报修
 //     或其他业务事件。
@@ -44,10 +48,17 @@ type ticketRemap struct {
 	NewID string
 }
 
+// partRemap 记录一笔备件领用的原领用编号与新领用编号。
+type partRemap struct {
+	OldID string
+	NewID string
+}
+
 // importOutcome 为一次成功导入的结果摘要，用于输出。
 type importOutcome struct {
 	assetIDs []string
 	tickets  []ticketRemap
+	parts    []partRemap
 	plans    int
 }
 
@@ -83,11 +94,17 @@ func cmdImport(args []string, w io.Writer) error {
 	}
 	if len(outcome.tickets) == 0 {
 		fmt.Fprintln(w, "所选资产没有工单，未分配新工单编号。")
-		return nil
+	} else {
+		fmt.Fprintln(w, "工单编号映射（原编号 -> 新编号）:")
+		for _, m := range outcome.tickets {
+			fmt.Fprintf(w, "%s -> %s\n", m.OldID, m.NewID)
+		}
 	}
-	fmt.Fprintln(w, "工单编号映射（原编号 -> 新编号）:")
-	for _, m := range outcome.tickets {
-		fmt.Fprintf(w, "%s -> %s\n", m.OldID, m.NewID)
+	if len(outcome.parts) > 0 {
+		fmt.Fprintln(w, "领用编号映射（原编号 -> 新编号）:")
+		for _, m := range outcome.parts {
+			fmt.Fprintf(w, "%s -> %s\n", m.OldID, m.NewID)
+		}
 	}
 	return nil
 }
@@ -215,6 +232,28 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 			"%w: 目标履历序号容量不足：当前最大序号 %d 无法容纳 %d 条导入履历，整批拒绝导入",
 			errConflict, maxSeq, len(events))
 	}
+	// 所选工单的全部备件领用记录，按源领用序号升序重新分配领用编号。
+	srcTicketIDs := map[string]bool{}
+	for _, t := range tickets {
+		srcTicketIDs[t.ID] = true
+	}
+	parts := make([]*PartWithdrawal, 0)
+	for _, p := range src.data.Parts {
+		if srcTicketIDs[p.TicketID] {
+			parts = append(parts, p)
+		}
+	}
+	sort.SliceStable(parts, func(i, j int) bool {
+		ni, _ := parsePartSeq(parts[i].ID)
+		nj, _ := parsePartSeq(parts[j].ID)
+		return ni < nj
+	})
+	// 领用编号容量：与 withdrawPart 同一约束，可分配的最大序号为 math.MaxInt-1。
+	if len(parts) > math.MaxInt-s.data.NextPartSeq {
+		return nil, fmt.Errorf(
+			"%w: 目标领用编号容量不足：下一序号 %d 无法容纳 %d 笔导入领用，整批拒绝导入",
+			errConflict, s.data.NextPartSeq, len(parts))
+	}
 
 	// 检查全部通过，一次性应用合并。资产编号、名称、位置、状态与工单的描述、
 	// 终态内容、负责人等业务信息原样保留；履历时间保留原瞬间与小数秒精度。
@@ -251,12 +290,27 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		next++
 	}
 	s.data.NextTicketSeq = next
+	// 备件领用记录按源领用顺序重新分配领用编号，工单引用同步替换；
+	// 数量、累计退回与说明等业务信息原样保留。
+	partIDs := map[string]string{}
+	nextPart := s.data.NextPartSeq
+	for _, p := range parts {
+		np := *p
+		np.ID = fmt.Sprintf("P%04d", nextPart)
+		np.TicketID = remap[p.TicketID]
+		partIDs[p.ID] = np.ID
+		s.data.Parts = append(s.data.Parts, &np)
+		outcome.parts = append(outcome.parts, partRemap{OldID: p.ID, NewID: np.ID})
+		nextPart++
+	}
+	s.data.NextPartSeq = nextPart
 	seq := maxSeq
 	for _, e := range events {
 		seq++
 		ne := e
 		ne.Seq = seq
 		ne.TicketID = remap[e.TicketID]
+		ne.WithdrawalID = partIDs[e.WithdrawalID]
 		s.data.Events = append(s.data.Events, ne)
 	}
 	return outcome, nil
