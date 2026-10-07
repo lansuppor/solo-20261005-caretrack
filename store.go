@@ -42,6 +42,8 @@ const (
 	eventAttach       = "附件登记"
 	eventAttachRevoke = "附件撤销"
 
+	eventRelocate = "位置变更"
+
 	storeVersion = 1
 	dataFileName = "caretrack.json"
 )
@@ -61,20 +63,24 @@ type Asset struct {
 
 // Ticket 为维修工单。Assignee 为当前（或终结前最后）负责人，空表示未派工；
 // AssignedAt/AssignNote 为最近一次派工的变更时间与说明。
+// ReportLocation 为报修当时的资产位置（取报修履历序号当时的位置链值），
+// 维修中搬移不改变该值；没有位置履历的旧库缺省为空，加载时按起点核对，
+// 不补写。
 type Ticket struct {
-	ID           string `json:"id"`
-	AssetID      string `json:"asset_id"`
-	Description  string `json:"description"`
-	RequestID    string `json:"request_id"`
-	Status       string `json:"status"`
-	Result       string `json:"result,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	ClosedAt     string `json:"closed_at,omitempty"`
-	CancelReason string `json:"cancel_reason,omitempty"`
-	CancelledAt  string `json:"cancelled_at,omitempty"`
-	Assignee     string `json:"assignee,omitempty"`
-	AssignedAt   string `json:"assigned_at,omitempty"`
-	AssignNote   string `json:"assign_note,omitempty"`
+	ID             string `json:"id"`
+	AssetID        string `json:"asset_id"`
+	Description    string `json:"description"`
+	RequestID      string `json:"request_id"`
+	Status         string `json:"status"`
+	ReportLocation string `json:"report_location,omitempty"`
+	Result         string `json:"result,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	ClosedAt       string `json:"closed_at,omitempty"`
+	CancelReason   string `json:"cancel_reason,omitempty"`
+	CancelledAt    string `json:"cancelled_at,omitempty"`
+	Assignee       string `json:"assignee,omitempty"`
+	AssignedAt     string `json:"assigned_at,omitempty"`
+	AssignNote     string `json:"assign_note,omitempty"`
 }
 
 // Event 为履历条目（报修/派工/关闭/取消/停用/恢复使用/保养建立/保养完成/保养撤销/保养调整/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
@@ -698,6 +704,31 @@ func validateData(d *storeData) error {
 			}
 			continue
 		}
+		if e.Kind == eventRelocate {
+			// 位置变更为资产级履历：不属于任何工单，From/To 为原位置与新位置，
+			// 新位置非空且与原位置不同，不携带派工、保养、备件或附件字段。
+			// 位置链接续（原位置接续当时位置、最终位置与资产保存值一致）在
+			// 下方按履历序号重放时核对。
+			if e.TicketID != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录不应带有工单编号", e.Seq)
+			}
+			if e.From == "" || e.To == "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录缺少原位置或新位置", e.Seq)
+			}
+			if e.From == e.To {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录新位置与原位置相同", e.Seq)
+			}
+			if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 ||
+				e.NewContent != "" || e.OldContent != "" || e.OldDue != "" || e.OldInterval != 0 || e.OldNextDue != "" ||
+				e.PartID != "" || e.Quantity != 0 || e.WithdrawalID != "" ||
+				e.AttachmentID != "" || e.Path != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录不应带有保养、备件或附件字段", e.Seq)
+			}
+			if assets[e.AssetID] == nil {
+				return fmt.Errorf("履历矛盾：履历序号 %d 引用了不存在的资产", e.Seq)
+			}
+			continue
+		}
 		if e.TicketID == "" {
 			return errors.New("履历矛盾：存在字段不完整的履历记录")
 		}
@@ -1033,6 +1064,50 @@ func validateData(d *storeData) error {
 				a.ID, want, a.Status)
 		}
 	}
+	// 位置链：按全库履历序号重放每项资产的位置变更（不按履历时间或数组位置；
+	// 数组乱序、序号间隔、时间不递增仍合法）。以资产保存位置作为起点，每条
+	// 位置变更的原位置须接续当时位置，重放结束的位置须与资产当前保存值一致。
+	// 每张工单保存的报修地点须等于报修履历序号当时的位置；旧库没有位置履历
+	// 时，全部工单的报修地点都应等于起点位置。
+	locEvents := sortedLocationEvents(d.Events)
+	locByAsset := map[string][]Event{}
+	for _, e := range locEvents {
+		locByAsset[e.AssetID] = append(locByAsset[e.AssetID], e)
+	}
+	// locationStart 为每项资产首次变更前的位置（位置起点）：没有位置履历的
+	// 资产以保存位置作为起点；有履历时起点即第一条位置变更履历的原位置。
+	locationStart := map[string]string{}
+	for _, a := range d.Assets {
+		loc := a.Location
+		if evs := locByAsset[a.ID]; len(evs) > 0 {
+			loc = evs[0].From
+		}
+		locationStart[a.ID] = loc
+	}
+	for _, a := range d.Assets {
+		loc := locationStart[a.ID]
+		for _, e := range locByAsset[a.ID] {
+			if e.From != loc {
+				return fmt.Errorf("位置矛盾：资产 %s 的位置变更履历（序号 %d）原位置 %q 与当时位置 %q 不接续",
+					a.ID, e.Seq, e.From, loc)
+			}
+			loc = e.To
+		}
+		if loc != a.Location {
+			return fmt.Errorf("位置矛盾：按履历推进得到资产 %s 当前位置为 %q，与保存的 %q 不符",
+				a.ID, loc, a.Location)
+		}
+	}
+	for _, t := range d.Tickets {
+		// 工单保存的报修地点须等于报修履历序号当时的位置。旧库工单没有该字段
+		// （且查询不补写）：缺省即视为按报修履历序号推导的值，始终一致；新工单
+		// 由 report 显式写入，一旦保存就必须与推导值相符。
+		want := locationAt(locationStart[t.AssetID], locByAsset[t.AssetID], t.AssetID, reportSeq[t.ID])
+		if t.ReportLocation != "" && t.ReportLocation != want {
+			return fmt.Errorf("位置矛盾：工单 %s 保存的报修地点 %q 与报修履历（序号 %d）当时的资产位置 %q 不符",
+				t.ID, t.ReportLocation, reportSeq[t.ID], want)
+		}
+	}
 	// 保养计划：归属存在的资产、每项资产最多一个、日期有效、间隔为正整数。
 	plans := map[string]*Plan{}
 	for _, p := range d.Plans {
@@ -1318,13 +1393,18 @@ func (s *store) report(assetID, description, requestID string) (*Ticket, bool, e
 	if err != nil {
 		return nil, false, err
 	}
+	// 报修时位置取报修履历序号当时的资产位置（序号不大于报修序号的最后一条
+	// 位置变更的新位置，没有位置变更履历则为位置起点）；不能用当前地点、
+	// 履历时间或数组位置代替。新履历尚未追加，此处看到的正是报修前的位置链。
+	reportLocation := locationAt(asset.Location, sortedLocationEvents(s.data.Events), assetID, eventSeq)
 	t := &Ticket{
-		ID:          fmt.Sprintf("T%04d", seq),
-		AssetID:     assetID,
-		Description: description,
-		RequestID:   requestID,
-		Status:      ticketOpen,
-		CreatedAt:   s.now().Format(time.RFC3339),
+		ID:             fmt.Sprintf("T%04d", seq),
+		AssetID:        assetID,
+		Description:    description,
+		RequestID:      requestID,
+		Status:         ticketOpen,
+		ReportLocation: reportLocation,
+		CreatedAt:      s.now().Format(time.RFC3339),
 	}
 	s.data.NextTicketSeq = seq + 1
 	s.data.Tickets = append(s.data.Tickets, t)
