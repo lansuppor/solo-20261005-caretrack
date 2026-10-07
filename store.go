@@ -16,16 +16,20 @@ import (
 
 // 资产状态、工单状态与履历类型。
 const (
-	statusAvailable = "可用"
-	statusRepairing = "维修中"
-	ticketOpen      = "未关闭"
-	ticketClosed    = "已关闭"
-	ticketCancelled = "已取消"
+	statusAvailable      = "可用"
+	statusRepairing      = "维修中"
+	statusDecommissioned = "停用"
+	ticketOpen           = "未关闭"
+	ticketClosed         = "已关闭"
+	ticketCancelled      = "已取消"
 
 	eventReport = "报修"
 	eventClose  = "关闭"
 	eventCancel = "取消"
 	eventAssign = "派工"
+
+	eventDecommission = "停用"
+	eventRestore      = "恢复"
 
 	eventPlanCreate = "保养建立"
 	eventPlanDone   = "保养完成"
@@ -72,8 +76,10 @@ type Ticket struct {
 	AssignNote   string `json:"assign_note,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消/保养建立/保养完成/保养撤销/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
-// From/To 仅派工履历使用：原负责人（首次派工为空，展示为“未派工”）与新负责人。
+// Event 为履历条目（报修/派工/关闭/取消/停用/恢复/保养建立/保养完成/保养撤销/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
+// From/To 仅派工履历与停用、恢复履历使用：派工履历中为原负责人（首次派工为空，
+// 展示为“未派工”）与新负责人；停用、恢复履历中为原状态与新状态（停用为
+// 可用->停用，恢复为 停用->可用），Content 为操作理由。
 // Due/Done/Interval 仅保养履历使用：建立履历含首次到期日（Due）与间隔天数
 // （Interval），完成履历含周期到期日（Due）与实际完成日（Done）。
 // TargetSeq 仅保养撤销履历使用：被撤销的完成履历的全库序号；完成身份以此序号
@@ -357,7 +363,7 @@ func validateData(d *storeData) error {
 		if a == nil || a.ID == "" || a.Name == "" || a.Location == "" {
 			return errors.New("数据矛盾：存在字段不完整的资产记录")
 		}
-		if a.Status != statusAvailable && a.Status != statusRepairing {
+		if a.Status != statusAvailable && a.Status != statusRepairing && a.Status != statusDecommissioned {
 			return fmt.Errorf("状态矛盾：资产 %s 状态无效 %q", a.ID, a.Status)
 		}
 		if assets[a.ID] != nil {
@@ -526,13 +532,15 @@ func validateData(d *storeData) error {
 			return fmt.Errorf("请求绑定矛盾：工单 %s 缺少对应的报修请求绑定", t.ID)
 		}
 	}
-	// 状态：每项资产最多一张未关闭工单，有则“维修中”，无则“可用”。
+	// 状态：每项资产最多一张未关闭工单，有则“维修中”；无未关闭工单时按停用、
+	// 恢复履历链的最终结果区分“停用”与“可用”。停用资产不能有未关闭工单。
 	openCount := map[string]int{}
 	for _, t := range d.Tickets {
 		if t.Status == ticketOpen {
 			openCount[t.AssetID]++
 		}
 	}
+	decommissioned := decommissionedAssets(d.Events)
 	for _, a := range d.Assets {
 		c := openCount[a.ID]
 		if c > 1 {
@@ -541,6 +549,8 @@ func validateData(d *storeData) error {
 		want := statusAvailable
 		if c == 1 {
 			want = statusRepairing
+		} else if decommissioned[a.ID] {
+			want = statusDecommissioned
 		}
 		if a.Status != want {
 			return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未关闭工单，状态应为 %s，实际为 %s",
@@ -608,6 +618,33 @@ func validateData(d *storeData) error {
 				if done < due {
 					return fmt.Errorf("履历矛盾：履历序号 %d 的完成日早于周期到期日", e.Seq)
 				}
+			}
+			continue
+		}
+		if e.Kind == eventDecommission || e.Kind == eventRestore {
+			// 停用、恢复履历：资产级事件，不属于任何工单；内容即操作理由（非空
+			// 已检查），From/To 为原状态与新状态。不携带保养、备件或附件字段；
+			// 状态链的接续（当时可否转换、停用期间不得新报修或登记完成）在下方
+			// 按序号重放时核对。
+			if e.TicketID != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有工单编号", e.Seq, e.Kind)
+			}
+			if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有保养字段", e.Seq, e.Kind)
+			}
+			if e.PartID != "" || e.Quantity != 0 || e.WithdrawalID != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有备件字段", e.Seq, e.Kind)
+			}
+			if e.AttachmentID != "" || e.Path != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有附件编号或路径", e.Seq, e.Kind)
+			}
+			wantFrom, wantTo := statusAvailable, statusDecommissioned
+			if e.Kind == eventRestore {
+				wantFrom, wantTo = statusDecommissioned, statusAvailable
+			}
+			if e.From != wantFrom || e.To != wantTo {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录状态链应为 %s -> %s，实际为 %s -> %s",
+					e.Seq, e.Kind, wantFrom, wantTo, e.From, e.To)
 			}
 			continue
 		}
@@ -732,6 +769,7 @@ func validateData(d *storeData) error {
 	derivedOpen := map[string]string{}
 	derivedAssignee := map[string]string{}
 	derivedNote := map[string]string{}
+	derivedDecomm := map[string]bool{}
 	withdrawSeq := map[string]int{}
 	derivedReturned := map[string]int{}
 	attachRegSeq := map[string]int{}
@@ -746,8 +784,28 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：资产 %s 的上一张工单 %s 尚未结束就产生了工单 %s 的报修",
 					e.AssetID, prev, e.TicketID)
 			}
+			if derivedDecomm[e.AssetID] {
+				return fmt.Errorf("履历矛盾：资产 %s 在停用期间出现工单 %s 的报修履历（序号 %d）",
+					e.AssetID, e.TicketID, e.Seq)
+			}
 			derivedTicket[e.TicketID] = ticketOpen
 			derivedOpen[e.AssetID] = e.TicketID
+		case eventDecommission:
+			// 仅“可用”且无未关闭工单的资产可停用；重复停用拒绝。
+			if derivedDecomm[e.AssetID] {
+				return fmt.Errorf("履历矛盾：资产 %s 在停用期间再次出现停用履历（序号 %d）", e.AssetID, e.Seq)
+			}
+			if prev := derivedOpen[e.AssetID]; prev != "" {
+				return fmt.Errorf("履历矛盾：资产 %s 的工单 %s 尚未结束就出现停用履历（序号 %d）",
+					e.AssetID, prev, e.Seq)
+			}
+			derivedDecomm[e.AssetID] = true
+		case eventRestore:
+			// 仅停用资产可恢复。
+			if !derivedDecomm[e.AssetID] {
+				return fmt.Errorf("履历矛盾：资产 %s 未处于停用状态就出现恢复履历（序号 %d）", e.AssetID, e.Seq)
+			}
+			derivedDecomm[e.AssetID] = false
 		case eventAssign:
 			if derivedTicket[e.TicketID] != ticketOpen {
 				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现派工履历", e.TicketID)
@@ -902,6 +960,8 @@ func validateData(d *storeData) error {
 		want := statusAvailable
 		if derivedOpen[a.ID] != "" {
 			want = statusRepairing
+		} else if derivedDecomm[a.ID] {
+			want = statusDecommissioned
 		}
 		if a.Status != want {
 			return fmt.Errorf("状态矛盾：按履历推进得到资产 %s 状态为 %s，与保存的 %s 不符",
@@ -941,7 +1001,18 @@ func validateData(d *storeData) error {
 	doneSeqs := map[string][]int{}
 	doneDue := map[string]map[int]string{}
 	revokedDone := map[int]bool{}
+	decommMaint := map[string]bool{}
 	for _, e := range sorted {
+		// 停用、恢复履历推进资产的停用状态：停用期间不得登记保养完成
+		// （建立计划与撤销已登记完成不受限）。
+		if e.Kind == eventDecommission {
+			decommMaint[e.AssetID] = true
+			continue
+		}
+		if e.Kind == eventRestore {
+			decommMaint[e.AssetID] = false
+			continue
+		}
 		if e.Kind != eventPlanCreate && e.Kind != eventPlanDone && e.Kind != eventPlanRevoke {
 			continue
 		}
@@ -988,6 +1059,9 @@ func validateData(d *storeData) error {
 			derivedDue[e.AssetID] = due
 			continue
 		}
+		if decommMaint[e.AssetID] {
+			return fmt.Errorf("履历矛盾：资产 %s 在停用期间出现保养完成履历（序号 %d）", e.AssetID, e.Seq)
+		}
 		if e.Due != derivedDue[e.AssetID] {
 			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）周期到期日 %s 与当前下一到期日 %s 不接续",
 				e.AssetID, e.Seq, e.Due, derivedDue[e.AssetID])
@@ -1016,6 +1090,25 @@ func validateData(d *storeData) error {
 		}
 	}
 	return nil
+}
+
+// decommissionedAssets 按履历序号重放停用、恢复履历，返回最终处于停用状态的
+// 资产集合。只用于状态核对；履历链本身的合法性（当时可否转换、停用期间不得
+// 新报修或登记完成）由 validateData 的重放校验检查。
+func decommissionedAssets(events []Event) map[string]bool {
+	sorted := make([]Event, len(events))
+	copy(sorted, events)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
+	out := map[string]bool{}
+	for _, e := range sorted {
+		switch e.Kind {
+		case eventDecommission:
+			out[e.AssetID] = true
+		case eventRestore:
+			out[e.AssetID] = false
+		}
+	}
+	return out
 }
 
 // save 将全部业务数据一次性原子写入：先写同目录临时文件，fsync 后 rename
@@ -1178,6 +1271,11 @@ func (s *store) report(assetID, description, requestID string) (*Ticket, bool, e
 	if t := s.openTicketOf(assetID); t != nil {
 		return nil, false, fmt.Errorf("%w: 资产 %s 已有未关闭工单 %s", errConflict, assetID, t.ID)
 	}
+	// 停用期间拒绝新报修：不绑定请求标识，恢复后可用同一标识重试。
+	// 已有绑定的相同重放在上方先行返回，不受停用影响。
+	if asset.Status == statusDecommissioned {
+		return nil, false, fmt.Errorf("%w: 资产 %s 已停用，不能报修（恢复使用后可重试）", errConflict, assetID)
+	}
 	// 先确认编号与履历计数器都能推进，再修改任何业务数据：
 	// 编号耗尽时拒绝新报修，不消耗编号，也不绑定请求标识。
 	seq := s.data.NextTicketSeq
@@ -1303,4 +1401,54 @@ func (s *store) assignTicket(ticketID, assignee, note string) (*Ticket, error) {
 	t.AssignedAt = s.now().Format(time.RFC3339)
 	t.AssignNote = note
 	return t, nil
+}
+
+// decommissionAsset 停用资产：仅当前“可用”且无未关闭工单的资产可停用，理由
+// 非空。成功时资产变为“停用”，追加一条含操作时间、原状态、新状态与理由的
+// 资产级履历；不创建工单、不消耗工单编号，不删除工单、负责人、备件或附件
+// 记录，也不改变保养计划。失败路径不修改任何业务数据。
+func (s *store) decommissionAsset(assetID, reason string) (*Asset, error) {
+	a := s.findAsset(assetID)
+	if a == nil {
+		return nil, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
+	}
+	if reason == "" {
+		return nil, fmt.Errorf("%w: 停用理由不能为空", errConflict)
+	}
+	if a.Status == statusDecommissioned {
+		return nil, fmt.Errorf("%w: 资产 %s 已停用，不能重复停用", errConflict, assetID)
+	}
+	if a.Status == statusRepairing {
+		return nil, fmt.Errorf("%w: 资产 %s 正在维修中（有未关闭工单），不能停用", errConflict, assetID)
+	}
+	eventSeq, err := s.nextEventSeq()
+	if err != nil {
+		return nil, err
+	}
+	a.Status = statusDecommissioned
+	s.appendEvent(eventSeq, assetID, "", eventDecommission, reason, statusAvailable, statusDecommissioned)
+	return a, nil
+}
+
+// restoreAsset 恢复已停用资产为“可用”，理由非空。成功时追加一条含操作时间、
+// 原状态、新状态与理由的资产级履历；停用履历保留不删除，保养计划的下一到期日
+// 不变，恢复后按保存的下一到期日参与到期查询。失败路径不修改任何业务数据。
+func (s *store) restoreAsset(assetID, reason string) (*Asset, error) {
+	a := s.findAsset(assetID)
+	if a == nil {
+		return nil, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
+	}
+	if reason == "" {
+		return nil, fmt.Errorf("%w: 恢复理由不能为空", errConflict)
+	}
+	if a.Status != statusDecommissioned {
+		return nil, fmt.Errorf("%w: 资产 %s 未处于停用状态（当前为 %s），不能恢复", errConflict, assetID, a.Status)
+	}
+	eventSeq, err := s.nextEventSeq()
+	if err != nil {
+		return nil, err
+	}
+	a.Status = statusAvailable
+	s.appendEvent(eventSeq, assetID, "", eventRestore, reason, statusDecommissioned, statusAvailable)
+	return a, nil
 }

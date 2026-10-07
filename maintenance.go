@@ -199,8 +199,13 @@ func (s *store) createPlan(assetID, content, firstDue string, intervalDays int) 
 // 若下一到期日超出 9999-12-31，整次拒绝。返回完成履历的全库序号。
 // 失败路径不修改任何业务数据。
 func (s *store) completePlan(assetID, due, done, result string) (*Plan, string, int, error) {
-	if s.findAsset(assetID) == nil {
+	a := s.findAsset(assetID)
+	if a == nil {
 		return nil, "", 0, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
+	}
+	// 停用期间拒绝保养完成登记；建立计划与撤销已登记完成不受限。
+	if a.Status == statusDecommissioned {
+		return nil, "", 0, fmt.Errorf("%w: 资产 %s 已停用，不能登记保养完成（恢复使用后可重试）", errConflict, assetID)
 	}
 	p := s.findPlan(assetID)
 	if p == nil {
@@ -320,6 +325,7 @@ type duePlanRow struct {
 }
 
 // duePlans 列出下一到期日不晚于 date 的保养计划，按到期日再按资产编号排序。
+// 停用资产的计划被排除（计划本身与下一到期日不变，恢复后重新参与）。
 // 只读：不写文件、不初始化目录、不推进计划。date 须为有效日期（调用方校验）。
 func (s *store) duePlans(date string) []duePlanRow {
 	rows := make([]duePlanRow, 0)
@@ -331,6 +337,9 @@ func (s *store) duePlans(date string) []duePlanRow {
 		a := s.findAsset(p.AssetID)
 		if a == nil {
 			continue // 整库一致性检查已保证归属；防御性跳过
+		}
+		if a.Status == statusDecommissioned {
+			continue // 停用资产不参与到期查询
 		}
 		rows = append(rows, duePlanRow{AssetID: p.AssetID, Name: a.Name, Content: p.Content, Due: p.NextDue})
 	}

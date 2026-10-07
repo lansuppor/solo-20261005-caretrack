@@ -29,6 +29,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   ticket     按工单编号查询工单状态与负责人
   close      关闭工单并填写维修结果，设备恢复“可用”
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
+  decommission 停用资产（仅“可用”且无未关闭工单时），期间拒绝新报修与保养完成登记
+  restore    恢复已停用的资产为“可用”
   plan       为资产建立唯一的周期保养计划（不可覆盖）
   maintain   登记当前周期的保养完成，推进下一到期日，显示完成履历序号
   unmaintain 按完成履历序号撤销误登记的保养完成，恢复下一到期日
@@ -37,7 +39,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   return     按领用编号退回备件（允许多次部分退回）
   attach     为工单登记本地资料附件索引（只保存引用，不复制文件）
   revoke     按附件编号撤销附件索引（保留记录、路径、说明与理由）
-  history    按资产查看履历（报修、派工、关闭、取消、保养建立、完成与撤销、备件领用与退回、附件登记与撤销事件）
+  history    按资产查看履历（报修、派工、关闭、取消、停用、恢复、保养建立、完成与撤销、备件领用与退回、附件登记与撤销事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
   import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划、备件记录与附件索引（复制，源只读）
   help       显示本帮助
@@ -52,6 +54,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   ticket   --ticket-id 工单编号                                 [--data-dir 目录]
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
+  decommission --asset-id 编号 --reason 停用理由             [--data-dir 目录]
+  restore  --asset-id 编号 --reason 恢复理由              [--data-dir 目录]
   plan     --asset-id 编号 --content 保养内容 --first-due 首次到期日
            --interval-days 间隔天数                           [--data-dir 目录]
   maintain --asset-id 编号 --due 周期到期日 --done 实际完成日 --result 结果
@@ -93,6 +97,18 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     理由与时间，资产恢复“可用”，可再次报修。取消不代表维修完成，不填写维修结果，
     不删除工单、履历或请求绑定，工单编号不回退也不复用；已取消工单不能关闭或再次
     取消，已关闭工单也不能取消。
+  - decommission 停用资产：仅当前“可用”且无未关闭工单的资产可停用，--reason 理由
+    非空；成功后资产变为“停用”，追加一条含操作时间、原状态、新状态与理由的资产级
+    履历，不创建工单、不消耗工单编号。未知资产、空理由、重复停用、维修中停用均
+    拒绝。restore 仅对停用资产有效，成功后恢复为“可用”，同样追加资产级履历；
+    历史履历不因恢复而删除。停用期间拒绝新报修（被拒绝的报修不绑定请求标识，
+    恢复后可重试）与保养完成登记；已有报修请求的相同重放即使资产停用仍返回原
+    工单及当前状态，不开单、不改资产状态，冲突请求仍拒绝。停用不删除工单、
+    负责人、备件或附件记录，终态工单仍可补充、撤销附件；维修停机统计仍只计算
+    工单占用，停用区间不计入。停用、恢复不改变保养内容、间隔或下一到期日，不
+    暂停或重算周期：停用资产仍可建立计划、按原规则撤销已登记完成，detail 展示
+    计划，due 排除停用资产；恢复后按保存的下一到期日参与到期查询，逾期计划仍
+    显示原到期日，随后完成沿用按首次到期日和间隔推进的规则。
   - 每项资产最多一个周期保养计划，建立后不可覆盖：保养内容非空，首次到期日为
     0001 至 9999 年的有效公历日期（YYYY-MM-DD），间隔天数为正整数；日期按日历日
     运算，不受时区与运行时刻影响。未知资产或已有计划时拒绝。资产详情显示保养
@@ -226,6 +242,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdClose(args[1:], stdout)
 	case "cancel":
 		err = cmdCancel(args[1:], stdout)
+	case "decommission":
+		err = cmdDecommission(args[1:], stdout)
+	case "restore":
+		err = cmdRestore(args[1:], stdout)
 	case "plan":
 		err = cmdPlan(args[1:], stdout)
 	case "maintain":
@@ -632,6 +652,74 @@ func cmdCancel(args []string, w io.Writer) error {
 	return nil
 }
 
+// cmdDecommission 停用资产：仅“可用”且无未关闭工单的资产可停用，理由非空。
+// 成功显示资产编号与新状态，并追加一条资产级履历；不创建工单、不消耗工单编号。
+func cmdDecommission(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var id, reason string
+	fs := newFlagSet("decommission", &opts)
+	fs.StringVar(&id, "asset-id", "", "企业资产编号（必填）")
+	fs.StringVar(&reason, "reason", "", "停用理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, id, "asset-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	asset, err := s.decommissionAsset(id, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "资产 %s 已停用。\n", asset.ID)
+	fmt.Fprintf(w, "当前状态: %s\n", asset.Status)
+	return nil
+}
+
+// cmdRestore 恢复已停用资产为“可用”，理由非空。成功显示资产编号与新状态，
+// 并追加一条资产级履历；停用履历保留不删除。
+func cmdRestore(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var id, reason string
+	fs := newFlagSet("restore", &opts)
+	fs.StringVar(&id, "asset-id", "", "企业资产编号（必填）")
+	fs.StringVar(&reason, "reason", "", "恢复理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, id, "asset-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	asset, err := s.restoreAsset(id, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "资产 %s 已恢复使用。\n", asset.ID)
+	fmt.Fprintf(w, "当前状态: %s\n", asset.Status)
+	return nil
+}
+
 // cmdPlan 为资产建立唯一的周期保养计划。日期与间隔的参数错误为退出码 2；
 // 未知资产、已有计划等业务失败为退出码 1。
 func cmdPlan(args []string, w io.Writer) error {
@@ -1001,6 +1089,9 @@ func cmdHistory(args []string, w io.Writer) error {
 		case eventAssign:
 			fmt.Fprintf(w, "[%s] %s 工单 %s: %s -> %s（%s）\n",
 				ts, e.Kind, e.TicketID, assigneeDisplay(e.From), e.To, e.Content)
+		case eventDecommission, eventRestore:
+			fmt.Fprintf(w, "[%s] %s: %s -> %s（%s）\n",
+				ts, e.Kind, e.From, e.To, e.Content)
 		case eventPlanCreate:
 			fmt.Fprintf(w, "[%s] %s: %s（首次到期日 %s，每 %d 天）\n",
 				ts, e.Kind, e.Content, e.Due, e.Interval)
