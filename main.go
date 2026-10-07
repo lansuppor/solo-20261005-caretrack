@@ -25,6 +25,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   list       列出全部资产及当前状态
   detail     查看资产详情及其未关闭工单编号、保养计划
   report     对资产报修，创建工单，资产转为“维修中”
+  batch-report 按本地 JSON 清单文件批量报修，一次提交多项设备故障（清单只读，整批原子生效）
   assign     为未关闭工单派工或转派维修人员
   ticket     按工单编号查询工单状态与负责人
   close      关闭工单并填写维修结果，设备恢复“可用”
@@ -50,6 +51,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   detail   --asset-id 编号                                    [--data-dir 目录]
   report   --asset-id 编号 --description 故障描述 --request-id 请求标识
                                                               [--data-dir 目录]
+  batch-report --file 清单文件                              [--data-dir 目录]
   assign   --ticket-id 工单编号 --assignee 维修人员 --note 说明  [--data-dir 目录]
   ticket   --ticket-id 工单编号                                 [--data-dir 目录]
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
@@ -85,6 +87,21 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     资产或工单编号：相同标识、资产、描述再次提交返回原工单及当前状态，不新增
     记录；同一标识搭配不同资产或描述将被拒绝；原工单关闭或取消后重放仍返回原工单，
     不重开旧单，也不影响新单。
+  - batch-report 从 --file 指定的本地 JSON 清单批量报修（清单只读，不修改）：
+    清单为 JSON 数组，每项含非空的 asset_id（资产编号）、description（故障描述）
+    与 request_id（报修请求标识）；空清单、JSON 格式错误、含未知字段或缺少必填
+    内容均整批拒绝（退出码 2）。批内同一请求标识搭配相同资产与描述的重复项合并
+    为一项；同一标识搭配不同资产或描述（无论冲突来自批内还是已有绑定）整批拒绝。
+    已有相同绑定的项返回原工单及当前状态（重放），不新增履历；即使原单已关闭或
+    取消、资产停用或已有后来工单，重放也不重开原单、不改变资产或后来工单。其余
+    项按 report 规则创建工单：未知资产、停用资产、已有未关闭工单（含本批前项刚
+    开出的工单）均整批拒绝；旧请求重放与该资产的一项合法新报修可以共存。新工单
+    按清单首次出现顺序分配连续工单编号与报修履历序号，重复项与重放不消耗编号；
+    每张新单恰有一条报修履历，所属资产变为“维修中”，不追加批次业务事件。含新
+    请求时整批一次原子保存后才输出成功结果；纯重放为只读，不写文件、不初始化
+    目录，编号或履历容量耗尽也不妨碍合法重放。任一项不合法、容量不足或读写失败
+    均整批失败并指出清单项位置，不输出部分成功结果，不留下部分记录或请求绑定、
+    不消耗编号，恢复条件后可重试。
   - 仅未关闭工单可派工：没有负责人时首次派工，已有负责人时转派给不同人员。
     维修人员标识只是本地文本记录（非人员账户），与派工说明均不能为空；
     成功后保存负责人、变更时间与说明，并追加一条含原负责人（首次派工为
@@ -235,6 +252,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdDetail(args[1:], stdout)
 	case "report":
 		err = cmdReport(args[1:], stdout)
+	case "batch-report":
+		err = cmdBatchReport(args[1:], stdout)
 	case "assign":
 		err = cmdAssign(args[1:], stdout)
 	case "ticket":
