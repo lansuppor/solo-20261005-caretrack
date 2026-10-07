@@ -42,7 +42,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   return     按领用编号退回备件（允许多次部分退回）
   attach     为工单登记本地资料附件索引（只保存引用，不复制文件）
   revoke     按附件编号撤销附件索引（保留记录、路径、说明与理由）
-  history    按资产查看履历（报修、派工、关闭、取消、停用、恢复使用、位置变更、保养建立、完成、撤销与调整、备件领用与退回、附件登记与撤销事件）
+  history    按资产查看履历（报修、派工、关闭、取消、停用、恢复使用、位置变更、保养建立、完成、撤销与调整、备件领用与退回、附件登记与撤销事件；每条标注全库序号）
+  replay     按履历进度回看设备在指定截止序号当时的状态（只读，不改变任何记录）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
   import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划、备件记录与附件索引（复制，源只读）
   export     把所选资产及其全部关联数据与附件资料文件打包为离线迁移包（源只读）
@@ -79,6 +80,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   attach   --ticket-id 工单编号 --path 文件路径 --note 说明  [--data-dir 目录]
   revoke   --attachment-id 附件编号 --reason 理由            [--data-dir 目录]
   history  --asset-id 编号                                    [--data-dir 目录]
+  replay   --asset-id 编号 --cutoff 截止履历序号             [--data-dir 目录]
   downtime --start 起点 --end 终点 [--asset-id 编号]          [--data-dir 目录]
   import   --source-dir 源目录 --asset-id 编号 [--asset-id 编号...]
                                                               [--data-dir 目录]
@@ -275,6 +277,25 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     目标目录或部分资料，输入包与原数据字节保持，恢复条件后可用原包重试。还原
     后移走源目录仍能读取有效附件，已撤销索引仍保持撤销；重载、查询、请求重放
     及后续维修、保养、搬移和编号延续按原规则运行。
+  - replay 为只读的按履历进度回看：输入资产编号与必填的非负整数 --cutoff
+    截止序号，只纳入全库序号不大于截止值的履历；截止值不必对应现存事件，落在
+    序号间隔中仍可查询，超过全库最大序号按全部履历处理，序号 0 为初态。回看
+    针对当前已登记资产的履历进度，不判断资产登记时间，编号和名称沿用登记信息。
+    序号 0 及无履历资产的初态为可用、无工单、无保养计划；初始位置取最早位置
+    变更履历的原位置，没有位置履历则取保存位置。成功显示资产编号、名称、截止
+    序号、当时位置和状态，以及当时未关闭工单的编号、负责人和报修地点、当时
+    保养方案段的内容、首次到期日、间隔和下一到期日；无工单、无计划分别明确
+    提示，未派工显示“未派工”，停用期间仍显示保存的保养方案与到期日。报修、
+    派工、关闭、取消、停用、恢复使用与位置变更全部按全库序号重放还原，不能
+    直接采用记录中保存的最终状态或负责人；维修中搬移后位置随搬移改变，旧单
+    报修地点保持。保养建立、完成、撤销与调整采用截止处的方案段：延期完成按
+    当段起点和间隔推进，跳过周期不补记录；撤销按目标完成序号恢复周期，同
+    到期日重新完成按新序号区分；调整后采用新方案。截止之后的关闭、转派、
+    搬移、恢复、撤销或调整不提前影响回看结果。查询前检查整库一致性，即使
+    矛盾位于截止之后或其他资产也整次拒绝并说明问题类别，不输出部分摘要；
+    未知资产拒绝。import 后按目标履历序号和映射后的工单编号回看，restore 后
+    按保留序号回看。查询成功或失败均不写文件、不初始化目录、不消耗编号、
+    不改请求绑定或当前业务状态，后续日常操作仍从真实当前状态继续。
 
 无参数、--help、-h 显示本帮助；参数错误或业务失败以非零退出码结束并说明原因。
 参数错误退出码为 2；未知资产、上述时间异常及数据读取失败退出码为 1。
@@ -353,6 +374,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdRevoke(args[1:], stdout)
 	case "history":
 		err = cmdHistory(args[1:], stdout)
+	case "replay":
+		err = cmdReplay(args[1:], stdout)
 	case "downtime":
 		err = cmdDowntime(args[1:], stdout)
 	case "import":
@@ -1279,40 +1302,105 @@ func cmdHistory(args []string, w io.Writer) error {
 		ts := e.Time.Format("2006-01-02T15:04:05Z07:00")
 		switch e.Kind {
 		case eventDeactivate, eventReactivate:
-			fmt.Fprintf(w, "[%s] %s: %s -> %s（%s）\n",
-				ts, e.Kind, e.From, e.To, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s: %s -> %s（%s）\n",
+				ts, e.Seq, e.Kind, e.From, e.To, e.Content)
 		case eventRelocate:
-			fmt.Fprintf(w, "[%s] %s: %s -> %s（%s）\n",
-				ts, e.Kind, e.From, e.To, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s: %s -> %s（%s）\n",
+				ts, e.Seq, e.Kind, e.From, e.To, e.Content)
 		case eventAssign:
-			fmt.Fprintf(w, "[%s] %s 工单 %s: %s -> %s（%s）\n",
-				ts, e.Kind, e.TicketID, assigneeDisplay(e.From), e.To, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s 工单 %s: %s -> %s（%s）\n",
+				ts, e.Seq, e.Kind, e.TicketID, assigneeDisplay(e.From), e.To, e.Content)
 		case eventPlanCreate:
-			fmt.Fprintf(w, "[%s] %s: %s（首次到期日 %s，每 %d 天）\n",
-				ts, e.Kind, e.Content, e.Due, e.Interval)
+			fmt.Fprintf(w, "[%s] #%d %s: %s（首次到期日 %s，每 %d 天）\n",
+				ts, e.Seq, e.Kind, e.Content, e.Due, e.Interval)
 		case eventPlanDone:
 			status := "有效"
 			if revoked[e.Seq] {
 				status = "已撤销"
 			}
-			fmt.Fprintf(w, "[%s] %s（序号 %d，%s）: 周期到期日 %s，实际完成日 %s，%s\n",
-				ts, e.Kind, e.Seq, status, e.Due, e.Done, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s（序号 %d，%s）: 周期到期日 %s，实际完成日 %s，%s\n",
+				ts, e.Seq, e.Kind, e.Seq, status, e.Due, e.Done, e.Content)
 		case eventPlanRevoke:
-			fmt.Fprintf(w, "[%s] %s: 目标完成履历序号 %d（%s）\n",
-				ts, e.Kind, e.TargetSeq, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s: 目标完成履历序号 %d（%s）\n",
+				ts, e.Seq, e.Kind, e.TargetSeq, e.Content)
 		case eventPlanAdjust:
-			fmt.Fprintf(w, "[%s] %s: %s（内容 %s -> %s，首次到期日 %s -> %s，每 %d 天 -> 每 %d 天，原下一到期日 %s）\n",
-				ts, e.Kind, e.Content, e.OldContent, e.NewContent, e.OldDue, e.Due,
+			fmt.Fprintf(w, "[%s] #%d %s: %s（内容 %s -> %s，首次到期日 %s -> %s，每 %d 天 -> 每 %d 天，原下一到期日 %s）\n",
+				ts, e.Seq, e.Kind, e.Content, e.OldContent, e.NewContent, e.OldDue, e.Due,
 				e.OldInterval, e.Interval, e.OldNextDue)
 		case eventPartWithdraw, eventPartReturn:
-			fmt.Fprintf(w, "[%s] %s 工单 %s: 领用编号 %s，备件 %s，数量 %d（%s）\n",
-				ts, e.Kind, e.TicketID, e.WithdrawalID, e.PartID, e.Quantity, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s 工单 %s: 领用编号 %s，备件 %s，数量 %d（%s）\n",
+				ts, e.Seq, e.Kind, e.TicketID, e.WithdrawalID, e.PartID, e.Quantity, e.Content)
 		case eventAttach, eventAttachRevoke:
-			fmt.Fprintf(w, "[%s] %s 工单 %s: 附件编号 %s，路径 %s（%s）\n",
-				ts, e.Kind, e.TicketID, e.AttachmentID, e.Path, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s 工单 %s: 附件编号 %s，路径 %s（%s）\n",
+				ts, e.Seq, e.Kind, e.TicketID, e.AttachmentID, e.Path, e.Content)
 		default:
-			fmt.Fprintf(w, "[%s] %s 工单 %s: %s\n", ts, e.Kind, e.TicketID, e.Content)
+			fmt.Fprintf(w, "[%s] #%d %s 工单 %s: %s\n", ts, e.Seq, e.Kind, e.TicketID, e.Content)
 		}
+	}
+	return nil
+}
+
+// cmdReplay 为按履历进度回看设备状态的只读查询：输入资产编号与必填的
+// 非负整数截止序号，只纳入全库序号不大于截止值的履历，重放当时的位置、
+// 状态、未关闭工单（负责人、报修地点）与保养方案段。截止值不必对应现存
+// 事件，落在序号间隔中仍可查询，超过全库最大序号按全部履历处理；序号 0
+// 为初态。openStore 已先做整库一致性检查：即使矛盾位于截止之后或其他
+// 资产，也整次拒绝（退出码 1）并说明问题类别。查询不写文件、不初始化
+// 目录、不消耗编号、不改请求绑定或当前业务状态。
+func cmdReplay(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var id string
+	fs := newFlagSet("replay", &opts)
+	fs.StringVar(&id, "asset-id", "", "企业资产编号（必填）")
+	cutoff := fs.Int("cutoff", 0, "截止履历序号（必填，非负整数；纳入序号不大于该值的履历，0 为初态）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, id, "asset-id"); err != nil {
+		return err
+	}
+	cutoffSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "cutoff" {
+			cutoffSet = true
+		}
+	})
+	if !cutoffSet {
+		return &usageError{msg: "命令 replay 缺少必填参数 --cutoff"}
+	}
+	if *cutoff < 0 {
+		return &usageError{msg: "--cutoff 须为非负整数（履历序号）"}
+	}
+
+	// openStore 已完成整库一致性检查：矛盾即使位于截止之后或属于其他资产，
+	// 也在此处整次拒绝，不会进入回看或输出部分摘要。
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	st, err := s.replayAsset(id, *cutoff)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "资产编号: %s\n", st.AssetID)
+	fmt.Fprintf(w, "名称: %s\n", st.Name)
+	fmt.Fprintf(w, "截止序号: %d\n", st.Cutoff)
+	fmt.Fprintf(w, "当时位置: %s\n", st.Location)
+	fmt.Fprintf(w, "当时状态: %s\n", st.Status)
+	if st.OpenTicket == nil {
+		fmt.Fprintln(w, "当时未关闭工单: 无")
+	} else {
+		fmt.Fprintf(w, "当时未关闭工单: %s\n", st.OpenTicket.ID)
+		fmt.Fprintf(w, "工单负责人: %s\n", assigneeDisplay(st.OpenTicket.Assignee))
+		fmt.Fprintf(w, "报修地点: %s\n", st.OpenTicket.ReportLocation)
+	}
+	if st.Plan == nil {
+		fmt.Fprintln(w, "当时保养计划: 无")
+	} else {
+		fmt.Fprintf(w, "保养内容: %s\n", st.Plan.Content)
+		fmt.Fprintf(w, "首次到期日: %s\n", st.Plan.FirstDue)
+		fmt.Fprintf(w, "保养间隔: 每 %d 天\n", st.Plan.IntervalDays)
+		fmt.Fprintf(w, "下一到期日: %s\n", st.Plan.NextDue)
 	}
 	return nil
 }
