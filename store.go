@@ -1064,153 +1064,84 @@ func validateData(d *storeData) error {
 	// 周期到期日；调整履历记录的原方案与原下一到期日须与当时状态一致，新首次
 	// 到期日须严格晚于当时所有未撤销完成的实际完成日，调整后下一到期日即新
 	// 首次到期日，旧段完成不能再撤销。由履历推出的当前方案与下一到期日须与
-	// 计划保存的一致。没有计划的资产不得有保养履历。
-	maintCreate := map[string]int{}
-	derivedDue := map[string]string{}
-	segContent := map[string]string{}
-	segFirst := map[string]string{}
-	segInterval := map[string]int{}
-	doneSeqs := map[string][]int{}
-	doneDue := map[string]map[int]string{}
-	allDone := map[string]map[int]bool{}
-	validDoneDay := map[string]map[int]int64{}
-	revokedDone := map[int]bool{}
-	// 停用状态随全库履历序号推进：停用期间不得登记保养完成；停用不暂停、不
-	// 重算周期，因此建立、完成、撤销与调整的接续规则本身不受影响。
-	deactivatedAt := map[string]bool{}
+	// 计划保存的一致。没有计划的资产不得有保养履历。停用状态随全库履历序号
+	// 推进：停用期间不得登记保养完成；停用不暂停、不重算周期，因此建立、完成、
+	// 撤销与调整的接续规则本身不受影响。以上判定与状态推进全部由保养规则核心
+	// （maintcore.go）完成，与日常操作共用同一套规则；核心只读履历，不修改
+	// 任何业务记录，也不补字段或修复数据。
+	core := newMaintCore()
 	for _, e := range sorted {
-		switch e.Kind {
-		case eventDeactivate:
-			deactivatedAt[e.AssetID] = true
-			continue
-		case eventReactivate:
-			delete(deactivatedAt, e.AssetID)
-			continue
-		}
-		if e.Kind != eventPlanCreate && e.Kind != eventPlanDone && e.Kind != eventPlanRevoke && e.Kind != eventPlanAdjust {
-			continue
-		}
-		p := plans[e.AssetID]
-		if p == nil {
+		if isPlanEvent(e.Kind) && plans[e.AssetID] == nil {
 			return fmt.Errorf("履历矛盾：资产 %s 没有保养计划，却存在保养履历（序号 %d）", e.AssetID, e.Seq)
 		}
-		if e.Kind == eventPlanCreate {
-			if maintCreate[e.AssetID] != 0 {
-				return fmt.Errorf("履历矛盾：资产 %s 有多条保养建立履历", e.AssetID)
-			}
-			maintCreate[e.AssetID] = e.Seq
-			segContent[e.AssetID] = e.Content
-			segFirst[e.AssetID] = e.Due
-			segInterval[e.AssetID] = e.Interval
-			derivedDue[e.AssetID] = e.Due
-			continue
+		if err := core.apply(e); err != nil {
+			return maintValidateError(err)
 		}
-		if maintCreate[e.AssetID] == 0 {
-			return fmt.Errorf("履历矛盾：资产 %s 的%s履历（序号 %d）出现在建立履历之前", e.AssetID, e.Kind, e.Seq)
-		}
-		if e.Kind == eventPlanAdjust {
-			// 调整履历记录的原方案与原下一到期日须与当时状态一致；新首次到期日
-			// 须严格晚于当时所有未撤销完成（含旧段）的实际完成日。调整后开启新
-			// 方案段：下一到期日设为新首次到期日，旧段完成不能再撤销。
-			if e.OldContent != segContent[e.AssetID] || e.OldDue != segFirst[e.AssetID] ||
-				e.OldInterval != segInterval[e.AssetID] {
-				return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）记录的原方案与资产 %s 当时的方案不符",
-					e.Seq, e.AssetID)
-			}
-			if e.OldNextDue != derivedDue[e.AssetID] {
-				return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）记录的原下一到期日 %s 与当时的下一到期日 %s 不符",
-					e.Seq, e.OldNextDue, derivedDue[e.AssetID])
-			}
-			newFirst, _ := parseDate(e.Due)
-			for doneSeq, doneDay := range validDoneDay[e.AssetID] {
-				if newFirst <= doneDay {
-					return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）的新首次到期日 %s 未严格晚于未撤销完成（序号 %d）的实际完成日 %s",
-						e.Seq, e.Due, doneSeq, formatDate(doneDay))
-				}
-			}
-			segContent[e.AssetID] = e.NewContent
-			segFirst[e.AssetID] = e.Due
-			segInterval[e.AssetID] = e.Interval
-			derivedDue[e.AssetID] = e.Due
-			doneSeqs[e.AssetID] = nil
-			doneDue[e.AssetID] = map[int]string{}
-			continue
-		}
-		if e.Kind == eventPlanRevoke {
-			// 目标须为当前段内先前的完成履历（更晚序号的完成此时尚未出现），
-			// 未撤销且为当时最新有效；撤销后下一到期日恢复为其周期到期日。
-			due, ok := doneDue[e.AssetID][e.TargetSeq]
-			if !ok {
-				if allDone[e.AssetID][e.TargetSeq] {
-					return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 属于资产 %s 调整前的旧方案段，旧段完成不能再撤销",
-						e.Seq, e.TargetSeq, e.AssetID)
-				}
-				return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 不是资产 %s 先前的完成履历",
-					e.Seq, e.TargetSeq, e.AssetID)
-			}
-			if revokedDone[e.TargetSeq] {
-				return fmt.Errorf("履历矛盾：完成履历序号 %d 被重复撤销（撤销履历序号 %d）", e.TargetSeq, e.Seq)
-			}
-			latest := 0
-			for _, seq := range doneSeqs[e.AssetID] {
-				if !revokedDone[seq] {
-					latest = seq
-				}
-			}
-			if latest != e.TargetSeq {
-				return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 不是当时最新的有效完成（序号 %d）",
-					e.Seq, e.TargetSeq, latest)
-			}
-			revokedDone[e.TargetSeq] = true
-			delete(validDoneDay[e.AssetID], e.TargetSeq)
-			derivedDue[e.AssetID] = due
-			continue
-		}
-		if e.Kind == eventPlanDone && deactivatedAt[e.AssetID] {
-			return fmt.Errorf("履历矛盾：资产 %s 在停用期间出现保养完成履历（序号 %d）",
-				e.AssetID, e.Seq)
-		}
-		if e.Due != derivedDue[e.AssetID] {
-			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）周期到期日 %s 与当前下一到期日 %s 不接续",
-				e.AssetID, e.Seq, e.Due, derivedDue[e.AssetID])
-		}
-		first, _ := parseDate(segFirst[e.AssetID])
-		done, _ := parseDate(e.Done)
-		next, ok := nextDueAfter(first, int64(segInterval[e.AssetID]), done)
-		if !ok {
-			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）无法推出日期范围内的下一到期日",
-				e.AssetID, e.Seq)
-		}
-		derivedDue[e.AssetID] = formatDate(next)
-		doneSeqs[e.AssetID] = append(doneSeqs[e.AssetID], e.Seq)
-		if doneDue[e.AssetID] == nil {
-			doneDue[e.AssetID] = map[int]string{}
-		}
-		doneDue[e.AssetID][e.Seq] = e.Due
-		if allDone[e.AssetID] == nil {
-			allDone[e.AssetID] = map[int]bool{}
-		}
-		allDone[e.AssetID][e.Seq] = true
-		if validDoneDay[e.AssetID] == nil {
-			validDoneDay[e.AssetID] = map[int]int64{}
-		}
-		validDoneDay[e.AssetID][e.Seq] = done
 	}
 	for _, p := range d.Plans {
-		if maintCreate[p.AssetID] == 0 {
+		content, firstDue, interval, nextDue, created := core.derived(p.AssetID)
+		if !created {
 			return fmt.Errorf("履历矛盾：资产 %s 的保养计划应有恰一条建立履历，实际没有", p.AssetID)
 		}
-		if segContent[p.AssetID] != p.Content || segFirst[p.AssetID] != p.FirstDue || segInterval[p.AssetID] != p.IntervalDays {
+		if content != p.Content || firstDue != p.FirstDue || interval != p.IntervalDays {
 			return fmt.Errorf("履历矛盾：按履历推出资产 %s 的当前方案（内容 %q、首次到期日 %s、每 %d 天）与保存的方案（内容 %q、首次到期日 %s、每 %d 天）不符",
-				p.AssetID, segContent[p.AssetID], segFirst[p.AssetID], segInterval[p.AssetID],
+				p.AssetID, content, firstDue, interval,
 				p.Content, p.FirstDue, p.IntervalDays)
 		}
-		if derivedDue[p.AssetID] != p.NextDue {
+		if nextDue != p.NextDue {
 			return fmt.Errorf("履历矛盾：按履历推出资产 %s 的下一到期日为 %s，与保存的 %s 不符",
-				p.AssetID, derivedDue[p.AssetID], p.NextDue)
+				p.AssetID, nextDue, p.NextDue)
 		}
 	}
 	return nil
+}
+
+// maintValidateError 把保养规则核心返回的规则冲突包装为台账校验场景的错误
+// （指明“履历矛盾”类别）；调用方拒绝查询与写入并保留原文件。
+func maintValidateError(err error) error {
+	var re *maintRuleError
+	if !errors.As(err, &re) {
+		return err
+	}
+	switch re.code {
+	case ruleDuplicateCreate:
+		return fmt.Errorf("履历矛盾：资产 %s 有多条保养建立履历", re.assetID)
+	case ruleBeforeCreate:
+		return fmt.Errorf("履历矛盾：资产 %s 的%s履历（序号 %d）出现在建立履历之前",
+			re.assetID, re.kind, re.seq)
+	case ruleAdjustScheme:
+		return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）记录的原方案与资产 %s 当时的方案不符",
+			re.seq, re.assetID)
+	case ruleAdjustNextDue:
+		return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）记录的原下一到期日 %s 与当时的下一到期日 %s 不符",
+			re.seq, re.dateA, re.dateB)
+	case ruleAdjustFirstDue:
+		return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）的新首次到期日 %s 未严格晚于未撤销完成（序号 %d）的实际完成日 %s",
+			re.seq, re.dateA, re.doneSeq, re.dateB)
+	case ruleRevokeOldSegment:
+		return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 属于资产 %s 调整前的旧方案段，旧段完成不能再撤销",
+			re.seq, re.target, re.assetID)
+	case ruleRevokeUnknown:
+		return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 不是资产 %s 先前的完成履历",
+			re.seq, re.target, re.assetID)
+	case ruleRevokeDuplicate:
+		return fmt.Errorf("履历矛盾：完成履历序号 %d 被重复撤销（撤销履历序号 %d）", re.target, re.seq)
+	case ruleRevokeNotLatest:
+		return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 不是当时最新的有效完成（序号 %d）",
+			re.seq, re.target, re.latest)
+	case ruleDoneDeactivated:
+		return fmt.Errorf("履历矛盾：资产 %s 在停用期间出现保养完成履历（序号 %d）", re.assetID, re.seq)
+	case ruleDueMismatch:
+		return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）周期到期日 %s 与当前下一到期日 %s 不接续",
+			re.assetID, re.seq, re.dateA, re.dateB)
+	case ruleDoneBeforeDue:
+		return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）完成日 %s 早于周期到期日 %s",
+			re.assetID, re.seq, re.dateA, re.dateB)
+	case ruleNextOverflow:
+		return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）无法推出日期范围内的下一到期日",
+			re.assetID, re.seq)
+	}
+	return err
 }
 
 // save 将全部业务数据一次性原子写入：先写同目录临时文件，fsync 后 rename

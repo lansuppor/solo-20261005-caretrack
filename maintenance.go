@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -18,6 +19,9 @@ import (
 // 保养历史划分为方案段：完成与撤销只作用于当时所在段，下一到期日按本段
 // 首次日加整数倍间隔推进；计划保存的是当前段方案与由履历链推出的下一到期日，
 // 加载与保存时核对二者一致。
+// 建立、完成、撤销与调整的业务判定及状态推进由保养规则核心（maintcore.go）
+// 统一完成，日常操作、台账加载、保存前校验与导入后校验共用；本文件只做
+// 记录级前置检查（存在性、参数形式）并按操作场景包装核心的规则错误。
 // 保养不创建或终结工单、不消耗工单编号，不改变资产状态、请求绑定或停机统计。
 
 // Plan 为资产的周期保养计划；每项资产最多一个，不可覆盖，但可经调整履历
@@ -162,6 +166,59 @@ func (s *store) appendMaintEvent(seq int, assetID, kind, content, due, done stri
 	})
 }
 
+// maintCore 用当前履历重放保养规则核心，供日常操作做业务判定。数据在加载
+// 与每次保存前均通过整库一致性检查，重放必然成功；失败说明内存数据损坏。
+// 核心只推进自己的派生状态，不修改任何业务记录。
+func (s *store) maintCore() (*maintCore, error) {
+	core := newMaintCore()
+	sorted := make([]Event, len(s.data.Events))
+	copy(sorted, s.data.Events)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
+	for _, e := range sorted {
+		if err := core.apply(e); err != nil {
+			return nil, fmt.Errorf("数据内部错误：保养履历重放失败: %w", err)
+		}
+	}
+	return core, nil
+}
+
+// maintOpError 把核心返回的规则冲突包装为日常操作场景的错误（errConflict
+// 类别，面向命令行的说明）。合法操作不可能触发的类别视为数据内部错误。
+func maintOpError(err error) error {
+	var re *maintRuleError
+	if !errors.As(err, &re) {
+		return err
+	}
+	switch re.code {
+	case ruleDoneDeactivated:
+		return fmt.Errorf("%w: 资产 %s 已停用，不能登记保养完成", errConflict, re.assetID)
+	case ruleDueMismatch:
+		return fmt.Errorf(
+			"%w: 周期到期日 %s 与资产 %s 当前下一到期日 %s 不符（旧周期不能重复登记，也不能登记新周期）",
+			errConflict, re.dateA, re.assetID, re.dateB)
+	case ruleDoneBeforeDue:
+		return fmt.Errorf("%w: 实际完成日 %s 早于周期到期日 %s", errConflict, re.dateA, re.dateB)
+	case ruleNextOverflow:
+		return fmt.Errorf(
+			"%w: 按完成日 %s 推算的下一到期日超出 9999-12-31，无法登记本次完成", errConflict, re.dateA)
+	case ruleAdjustFirstDue:
+		return fmt.Errorf(
+			"%w: 新首次到期日 %s 须严格晚于资产 %s 未撤销完成的实际完成日 %s",
+			errConflict, re.dateA, re.assetID, re.dateB)
+	case ruleRevokeOldSegment:
+		return fmt.Errorf(
+			"%w: 完成履历序号 %d 属于资产 %s 调整前的旧方案段，旧段完成不能再撤销",
+			errConflict, re.target, re.assetID)
+	case ruleRevokeDuplicate:
+		return fmt.Errorf("%w: 完成履历序号 %d 已撤销，不能重复撤销", errConflict, re.target)
+	case ruleRevokeNotLatest:
+		return fmt.Errorf(
+			"%w: 完成履历序号 %d 不是资产 %s 当前方案段最新的有效完成（当前为序号 %d），存在更晚有效完成时不能撤销",
+			errConflict, re.target, re.assetID, re.latest)
+	}
+	return fmt.Errorf("数据内部错误：%v", err)
+}
+
 // createPlan 为资产建立唯一的周期保养计划：每项资产最多一个，已有计划时拒绝，
 // 不覆盖。成功时追加一条含初始计划的建立履历，下一到期日即首次到期日。
 // 失败路径不修改任何业务数据。
@@ -181,16 +238,28 @@ func (s *store) createPlan(assetID, content, firstDue string, intervalDays int) 
 	if _, err := parseDate(firstDue); err != nil {
 		return nil, fmt.Errorf("%w: 首次到期日无效：%s", errConflict, err)
 	}
+	core, err := s.maintCore()
+	if err != nil {
+		return nil, err
+	}
+	// 候选履历不含序号：核心判定不依赖序号，真正的序号在判定通过后分配，
+	// 失败路径不消耗序号。
+	if err := core.apply(Event{
+		AssetID: assetID, Kind: eventPlanCreate, Content: content, Due: firstDue, Interval: intervalDays,
+	}); err != nil {
+		return nil, maintOpError(err)
+	}
 	eventSeq, err := s.nextEventSeq()
 	if err != nil {
 		return nil, err
 	}
+	_, _, _, nextDue, _ := core.derived(assetID)
 	p := &Plan{
 		AssetID:      assetID,
 		Content:      content,
 		FirstDue:     firstDue,
 		IntervalDays: intervalDays,
-		NextDue:      firstDue,
+		NextDue:      nextDue,
 	}
 	s.data.Plans = append(s.data.Plans, p)
 	s.appendMaintEvent(eventSeq, assetID, eventPlanCreate, content, firstDue, "", intervalDays)
@@ -221,46 +290,31 @@ func (s *store) adjustPlan(assetID, content, firstDue string, intervalDays int, 
 	if intervalDays < 1 {
 		return nil, nil, fmt.Errorf("%w: 保养间隔天数须为正整数", errConflict)
 	}
-	firstN, err := parseDate(firstDue)
-	if err != nil {
+	if _, err := parseDate(firstDue); err != nil {
 		return nil, nil, fmt.Errorf("%w: 新首次到期日无效：%s", errConflict, err)
 	}
-	// 新首次到期日须严格晚于所有未撤销完成的实际完成日（跨全部方案段）。
-	revoked := s.revokedDoneSeqs()
-	latestDone := int64(-1)
-	for _, e := range s.data.Events {
-		if e.AssetID != assetID || e.Kind != eventPlanDone || revoked[e.Seq] {
-			continue
-		}
-		doneN, _ := parseDate(e.Done)
-		if doneN > latestDone {
-			latestDone = doneN
-		}
+	core, err := s.maintCore()
+	if err != nil {
+		return nil, nil, err
 	}
-	if latestDone >= 0 && firstN <= latestDone {
-		return nil, nil, fmt.Errorf(
-			"%w: 新首次到期日 %s 须严格晚于资产 %s 未撤销完成的实际完成日 %s",
-			errConflict, firstDue, assetID, formatDate(latestDone))
+	old := *p
+	// 候选履历记录前后方案与原下一到期日（不含序号，核心判定不依赖序号）；
+	// 原方案接续与新首次日限制由共享核心判定。
+	cand := Event{
+		AssetID: assetID, Kind: eventPlanAdjust, Content: reason,
+		Due: firstDue, Interval: intervalDays, NewContent: content,
+		OldContent: old.Content, OldDue: old.FirstDue, OldInterval: old.IntervalDays, OldNextDue: old.NextDue,
+	}
+	if err := core.apply(cand); err != nil {
+		return nil, nil, maintOpError(err)
 	}
 	eventSeq, err := s.nextEventSeq()
 	if err != nil {
 		return nil, nil, err
 	}
-	old := *p
-	s.data.Events = append(s.data.Events, Event{
-		Seq:         eventSeq,
-		AssetID:     assetID,
-		Kind:        eventPlanAdjust,
-		Content:     reason,
-		Due:         firstDue,
-		Interval:    intervalDays,
-		NewContent:  content,
-		OldContent:  old.Content,
-		OldDue:      old.FirstDue,
-		OldInterval: old.IntervalDays,
-		OldNextDue:  old.NextDue,
-		Time:        s.now(),
-	})
+	cand.Seq = eventSeq
+	cand.Time = s.now()
+	s.data.Events = append(s.data.Events, cand)
 	p.Content = content
 	p.FirstDue = firstDue
 	p.IntervalDays = intervalDays
@@ -282,42 +336,37 @@ func (s *store) completePlan(assetID, due, done, result string) (*Plan, string, 
 	if p == nil {
 		return nil, "", 0, fmt.Errorf("%w: 资产 %s 没有保养计划", errNotFound, assetID)
 	}
-	if a := s.findAsset(assetID); a != nil && a.Status == statusDeactivated {
+	core, err := s.maintCore()
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if core.deactivatedNow(assetID) {
 		// 停用期间拒绝保养完成登记；停用不暂停或重算周期，保存的下一到期日不变。
 		return nil, "", 0, fmt.Errorf("%w: 资产 %s 已停用，不能登记保养完成", errConflict, assetID)
 	}
 	if result == "" {
 		return nil, "", 0, fmt.Errorf("%w: 保养结果不能为空", errConflict)
 	}
-	dueN, err := parseDate(due)
-	if err != nil {
+	if _, err := parseDate(due); err != nil {
 		return nil, "", 0, fmt.Errorf("%w: 周期到期日无效：%s", errConflict, err)
 	}
-	doneN, err := parseDate(done)
-	if err != nil {
+	if _, err := parseDate(done); err != nil {
 		return nil, "", 0, fmt.Errorf("%w: 实际完成日无效：%s", errConflict, err)
 	}
-	if due != p.NextDue {
-		return nil, "", 0, fmt.Errorf(
-			"%w: 周期到期日 %s 与资产 %s 当前下一到期日 %s 不符（旧周期不能重复登记，也不能登记新周期）",
-			errConflict, due, assetID, p.NextDue)
-	}
-	if doneN < dueN {
-		return nil, "", 0, fmt.Errorf("%w: 实际完成日 %s 早于周期到期日 %s", errConflict, done, due)
-	}
-	first, _ := parseDate(p.FirstDue)
-	next, ok := nextDueAfter(first, int64(p.IntervalDays), doneN)
-	if !ok {
-		return nil, "", 0, fmt.Errorf(
-			"%w: 按完成日 %s 推算的下一到期日超出 9999-12-31，无法登记本次完成", errConflict, done)
+	// 候选履历不含序号（核心判定不依赖序号）；接续、完成日不早于到期日与
+	// 日期范围判定全部由共享核心完成。
+	cand := Event{AssetID: assetID, Kind: eventPlanDone, Content: result, Due: due, Done: done}
+	if err := core.apply(cand); err != nil {
+		return nil, "", 0, maintOpError(err)
 	}
 	eventSeq, err := s.nextEventSeq()
 	if err != nil {
 		return nil, "", 0, err
 	}
-	p.NextDue = formatDate(next)
+	_, _, _, next, _ := core.derived(assetID)
+	p.NextDue = next
 	s.appendMaintEvent(eventSeq, assetID, eventPlanDone, result, due, done, 0)
-	return p, p.NextDue, eventSeq, nil
+	return p, next, eventSeq, nil
 }
 
 // revokedDoneSeqs 返回已被撤销的保养完成履历序号集合。
@@ -329,19 +378,6 @@ func (s *store) revokedDoneSeqs() map[int]bool {
 		}
 	}
 	return revoked
-}
-
-// currentSegmentStart 返回资产当前方案段的起点：该资产最近一次保养建立或
-// 调整履历的全库序号；没有保养履历时为 0。段边界按全库履历序号划分，不按
-// 日期或数组位置。
-func (s *store) currentSegmentStart(assetID string) int {
-	start := 0
-	for _, e := range s.data.Events {
-		if e.AssetID == assetID && (e.Kind == eventPlanCreate || e.Kind == eventPlanAdjust) && e.Seq > start {
-			start = e.Seq
-		}
-	}
-	return start
 }
 
 // revokeCompletion 撤销误登记的保养完成：目标须为该资产当前方案段内按序号最新
@@ -374,40 +410,25 @@ func (s *store) revokeCompletion(assetID string, targetSeq int, reason string) (
 	if target.Kind != eventPlanDone || target.AssetID != assetID {
 		return nil, nil, fmt.Errorf("%w: 履历序号 %d 不是资产 %s 的保养完成履历", errConflict, targetSeq, assetID)
 	}
-	segStart := s.currentSegmentStart(assetID)
-	if target.Seq < segStart {
-		return nil, nil, fmt.Errorf(
-			"%w: 完成履历序号 %d 属于资产 %s 调整前的旧方案段，旧段完成不能再撤销",
-			errConflict, targetSeq, assetID)
+	core, err := s.maintCore()
+	if err != nil {
+		return nil, nil, err
 	}
-	revoked := s.revokedDoneSeqs()
-	if revoked[targetSeq] {
-		return nil, nil, fmt.Errorf("%w: 完成履历序号 %d 已撤销，不能重复撤销", errConflict, targetSeq)
-	}
-	latest := 0
-	for _, e := range s.data.Events {
-		if e.AssetID == assetID && e.Kind == eventPlanDone && e.Seq > segStart && !revoked[e.Seq] && e.Seq > latest {
-			latest = e.Seq
-		}
-	}
-	if latest != targetSeq {
-		return nil, nil, fmt.Errorf(
-			"%w: 完成履历序号 %d 不是资产 %s 当前方案段最新的有效完成（当前为序号 %d），存在更晚有效完成时不能撤销",
-			errConflict, targetSeq, assetID, latest)
+	// 候选履历不含序号（核心判定不依赖序号）；段归属、重复撤销与最新有效
+	// 判定由共享核心完成。
+	cand := Event{AssetID: assetID, Kind: eventPlanRevoke, Content: reason, TargetSeq: targetSeq}
+	if err := core.apply(cand); err != nil {
+		return nil, nil, maintOpError(err)
 	}
 	eventSeq, err := s.nextEventSeq()
 	if err != nil {
 		return nil, nil, err
 	}
-	p.NextDue = target.Due
-	s.data.Events = append(s.data.Events, Event{
-		Seq:       eventSeq,
-		AssetID:   assetID,
-		Kind:      eventPlanRevoke,
-		Content:   reason,
-		TargetSeq: targetSeq,
-		Time:      s.now(),
-	})
+	cand.Seq = eventSeq
+	cand.Time = s.now()
+	s.data.Events = append(s.data.Events, cand)
+	_, _, _, next, _ := core.derived(assetID)
+	p.NextDue = next
 	return p, target, nil
 }
 
