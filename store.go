@@ -34,6 +34,7 @@ const (
 	eventPlanCreate = "保养建立"
 	eventPlanDone   = "保养完成"
 	eventPlanRevoke = "保养撤销"
+	eventPlanAdjust = "保养调整"
 
 	eventPartWithdraw = "领用"
 	eventPartReturn   = "退回"
@@ -76,13 +77,17 @@ type Ticket struct {
 	AssignNote   string `json:"assign_note,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消/停用/恢复使用/保养建立/保养完成/保养撤销/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/派工/关闭/取消/停用/恢复使用/保养建立/保养完成/保养撤销/保养调整/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
 // From/To 在派工履历中为原负责人（首次派工为空，展示为“未派工”）与新负责人；
 // 在停用、恢复使用履历中为原资产状态与新资产状态。
 // Due/Done/Interval 仅保养履历使用：建立履历含首次到期日（Due）与间隔天数
 // （Interval），完成履历含周期到期日（Due）与实际完成日（Done）。
 // TargetSeq 仅保养撤销履历使用：被撤销的完成履历的全库序号；完成身份以此序号
 // 标识，不能用到期日或报修请求标识代替。
+// 保养调整履历中 Content 为调整理由，Due/Interval 为新方案的首次到期日与间隔
+// 天数，NewContent 为新保养内容，OldContent/OldDue/OldInterval 为原方案的内容、
+// 首次到期日与间隔天数，OldNextDue 为调整前的下一到期日；调整以该履历的全库
+// 序号划分方案段，不按日期或数组位置。
 // PartID/Quantity/WithdrawalID 仅备件履历使用：领用与退回履历都携带备件编号、
 // 数量与所属领用编号；Content 分别为领用说明与退回理由。
 // AttachmentID/Path 仅附件履历使用：登记与撤销履历都携带附件编号与保存的绝对
@@ -99,6 +104,11 @@ type Event struct {
 	Done         string    `json:"-"`
 	Interval     int       `json:"-"`
 	TargetSeq    int       `json:"-"`
+	NewContent   string    `json:"-"`
+	OldContent   string    `json:"-"`
+	OldDue       string    `json:"-"`
+	OldInterval  int       `json:"-"`
+	OldNextDue   string    `json:"-"`
 	PartID       string    `json:"-"`
 	Quantity     int       `json:"-"`
 	WithdrawalID string    `json:"-"`
@@ -120,6 +130,11 @@ type eventJSON struct {
 	Done         string `json:"done,omitempty"`
 	Interval     int    `json:"interval,omitempty"`
 	TargetSeq    int    `json:"target_seq,omitempty"`
+	NewContent   string `json:"new_content,omitempty"`
+	OldContent   string `json:"old_content,omitempty"`
+	OldDue       string `json:"old_due,omitempty"`
+	OldInterval  int    `json:"old_interval,omitempty"`
+	OldNextDue   string `json:"old_next_due,omitempty"`
 	PartID       string `json:"part_id,omitempty"`
 	Quantity     int    `json:"quantity,omitempty"`
 	WithdrawalID string `json:"withdrawal_id,omitempty"`
@@ -133,6 +148,8 @@ func (e Event) toJSON() eventJSON {
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
 		Due: e.Due, Done: e.Done, Interval: e.Interval, TargetSeq: e.TargetSeq,
+		NewContent: e.NewContent, OldContent: e.OldContent,
+		OldDue: e.OldDue, OldInterval: e.OldInterval, OldNextDue: e.OldNextDue,
 		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
 		AttachmentID: e.AttachmentID, Path: e.Path,
 		// RFC3339Nano 保留小数秒精度；整秒时输出与 RFC3339 完全一致，
@@ -151,6 +168,8 @@ func (e eventJSON) toEvent() (Event, error) {
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
 		Due: e.Due, Done: e.Done, Interval: e.Interval, TargetSeq: e.TargetSeq,
+		NewContent: e.NewContent, OldContent: e.OldContent,
+		OldDue: e.OldDue, OldInterval: e.OldInterval, OldNextDue: e.OldNextDue,
 		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
 		AttachmentID: e.AttachmentID, Path: e.Path,
 		Time: t,
@@ -577,11 +596,48 @@ func validateData(d *storeData) error {
 		if e.AssetID == "" || e.Kind == "" || e.Content == "" {
 			return errors.New("履历矛盾：存在字段不完整的履历记录")
 		}
-		if e.Kind == eventPlanCreate || e.Kind == eventPlanDone || e.Kind == eventPlanRevoke {
-			// 保养履历：不属于任何工单，不携带派工字段；日期与间隔在此核对，
-			// 建立、完成及撤销链的接续在下方按序号重放时核对。
+		if e.Kind == eventPlanCreate || e.Kind == eventPlanDone || e.Kind == eventPlanRevoke || e.Kind == eventPlanAdjust {
+			// 保养履历：不属于任何工单，不携带派工、备件或附件字段；日期与间隔在此
+			// 核对，建立、完成、撤销与调整链的接续在下方按序号重放时核对。
 			if e.TicketID != "" || e.From != "" || e.To != "" {
 				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有工单编号或派工人员字段", e.Seq, e.Kind)
+			}
+			if e.PartID != "" || e.Quantity != 0 || e.WithdrawalID != "" ||
+				e.AttachmentID != "" || e.Path != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有备件或附件字段", e.Seq, e.Kind)
+			}
+			if e.Kind != eventPlanAdjust &&
+				(e.NewContent != "" || e.OldContent != "" || e.OldDue != "" || e.OldInterval != 0 || e.OldNextDue != "") {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有方案调整字段", e.Seq, e.Kind)
+			}
+			if e.Kind == eventPlanAdjust {
+				// 调整履历：内容即调整理由（非空已检查）；Due/Interval 为新方案的
+				// 首次到期日与间隔天数，另携带原方案与调整前的下一到期日。
+				if e.Done != "" || e.TargetSeq != 0 {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录不应带有完成日或目标完成履历序号", e.Seq)
+				}
+				if e.NewContent == "" {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录缺少新保养内容", e.Seq)
+				}
+				if _, err := parseDate(e.Due); err != nil {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录新首次到期日无效", e.Seq)
+				}
+				if e.Interval < 1 {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录新间隔天数须为正整数", e.Seq)
+				}
+				if e.OldContent == "" {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录缺少原保养内容", e.Seq)
+				}
+				if _, err := parseDate(e.OldDue); err != nil {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录原首次到期日无效", e.Seq)
+				}
+				if e.OldInterval < 1 {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录原间隔天数须为正整数", e.Seq)
+				}
+				if _, err := parseDate(e.OldNextDue); err != nil {
+					return fmt.Errorf("履历矛盾：履历序号 %d 的调整记录原下一到期日无效", e.Seq)
+				}
+				continue
 			}
 			if e.Kind == eventPlanRevoke {
 				// 撤销履历：内容即撤销理由（非空已检查），仅携带目标完成履历序号。
@@ -632,6 +688,7 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录缺少原状态或新状态", e.Seq, e.Kind)
 			}
 			if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 ||
+				e.NewContent != "" || e.OldContent != "" || e.OldDue != "" || e.OldInterval != 0 || e.OldNextDue != "" ||
 				e.PartID != "" || e.Quantity != 0 || e.WithdrawalID != "" ||
 				e.AttachmentID != "" || e.Path != "" {
 				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有保养、备件或附件字段", e.Seq, e.Kind)
@@ -644,7 +701,8 @@ func validateData(d *storeData) error {
 		if e.TicketID == "" {
 			return errors.New("履历矛盾：存在字段不完整的履历记录")
 		}
-		if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 {
+		if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 ||
+			e.NewContent != "" || e.OldContent != "" || e.OldDue != "" || e.OldInterval != 0 || e.OldNextDue != "" {
 			return fmt.Errorf("履历矛盾：履历序号 %d 的维修履历不应带有保养字段", e.Seq)
 		}
 		if e.Kind != eventAssign && (e.From != "" || e.To != "") {
@@ -998,18 +1056,27 @@ func validateData(d *storeData) error {
 		}
 		plans[p.AssetID] = p
 	}
-	// 保养履历链：每个计划恰有一条建立履历（内容、首次到期日、间隔与计划一致），
-	// 完成履历按序号接续（周期到期日须等于当时下一到期日，完成日不早于它），
-	// 撤销履历须引用先前同资产、未撤销且当时最新有效的完成，并把下一到期日恢复
-	// 为该完成的周期到期日；由履历推出的下一到期日须与计划保存的一致。
-	// 没有计划的资产不得有保养履历。
+	// 保养履历链：每个计划恰有一条建立履历；建立与每次调整以各自的全库履历序号
+	// 划分方案段（不按日期或数组位置），当前段方案为最近一次建立或调整记录的
+	// 内容、首次到期日与间隔。完成履历按序号接续（周期到期日须等于当时下一
+	// 到期日，完成日不早于它，按当时所在段的首次日加整数倍间隔推进），撤销履历
+	// 须引用当时所在段内未撤销且最新有效的完成，并把下一到期日恢复为该完成的
+	// 周期到期日；调整履历记录的原方案与原下一到期日须与当时状态一致，新首次
+	// 到期日须严格晚于当时所有未撤销完成的实际完成日，调整后下一到期日即新
+	// 首次到期日，旧段完成不能再撤销。由履历推出的当前方案与下一到期日须与
+	// 计划保存的一致。没有计划的资产不得有保养履历。
 	maintCreate := map[string]int{}
 	derivedDue := map[string]string{}
+	segContent := map[string]string{}
+	segFirst := map[string]string{}
+	segInterval := map[string]int{}
 	doneSeqs := map[string][]int{}
 	doneDue := map[string]map[int]string{}
+	allDone := map[string]map[int]bool{}
+	validDoneDay := map[string]map[int]int64{}
 	revokedDone := map[int]bool{}
 	// 停用状态随全库履历序号推进：停用期间不得登记保养完成；停用不暂停、不
-	// 重算周期，因此建立、完成与撤销的接续规则本身不受影响。
+	// 重算周期，因此建立、完成、撤销与调整的接续规则本身不受影响。
 	deactivatedAt := map[string]bool{}
 	for _, e := range sorted {
 		switch e.Kind {
@@ -1020,7 +1087,7 @@ func validateData(d *storeData) error {
 			delete(deactivatedAt, e.AssetID)
 			continue
 		}
-		if e.Kind != eventPlanCreate && e.Kind != eventPlanDone && e.Kind != eventPlanRevoke {
+		if e.Kind != eventPlanCreate && e.Kind != eventPlanDone && e.Kind != eventPlanRevoke && e.Kind != eventPlanAdjust {
 			continue
 		}
 		p := plans[e.AssetID]
@@ -1032,20 +1099,52 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：资产 %s 有多条保养建立履历", e.AssetID)
 			}
 			maintCreate[e.AssetID] = e.Seq
-			if e.Content != p.Content || e.Due != p.FirstDue || e.Interval != p.IntervalDays {
-				return fmt.Errorf("履历矛盾：资产 %s 的保养建立履历与计划内容、首次到期日或间隔不一致", e.AssetID)
-			}
+			segContent[e.AssetID] = e.Content
+			segFirst[e.AssetID] = e.Due
+			segInterval[e.AssetID] = e.Interval
 			derivedDue[e.AssetID] = e.Due
 			continue
 		}
 		if maintCreate[e.AssetID] == 0 {
 			return fmt.Errorf("履历矛盾：资产 %s 的%s履历（序号 %d）出现在建立履历之前", e.AssetID, e.Kind, e.Seq)
 		}
+		if e.Kind == eventPlanAdjust {
+			// 调整履历记录的原方案与原下一到期日须与当时状态一致；新首次到期日
+			// 须严格晚于当时所有未撤销完成（含旧段）的实际完成日。调整后开启新
+			// 方案段：下一到期日设为新首次到期日，旧段完成不能再撤销。
+			if e.OldContent != segContent[e.AssetID] || e.OldDue != segFirst[e.AssetID] ||
+				e.OldInterval != segInterval[e.AssetID] {
+				return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）记录的原方案与资产 %s 当时的方案不符",
+					e.Seq, e.AssetID)
+			}
+			if e.OldNextDue != derivedDue[e.AssetID] {
+				return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）记录的原下一到期日 %s 与当时的下一到期日 %s 不符",
+					e.Seq, e.OldNextDue, derivedDue[e.AssetID])
+			}
+			newFirst, _ := parseDate(e.Due)
+			for doneSeq, doneDay := range validDoneDay[e.AssetID] {
+				if newFirst <= doneDay {
+					return fmt.Errorf("履历矛盾：保养调整履历（序号 %d）的新首次到期日 %s 未严格晚于未撤销完成（序号 %d）的实际完成日 %s",
+						e.Seq, e.Due, doneSeq, formatDate(doneDay))
+				}
+			}
+			segContent[e.AssetID] = e.NewContent
+			segFirst[e.AssetID] = e.Due
+			segInterval[e.AssetID] = e.Interval
+			derivedDue[e.AssetID] = e.Due
+			doneSeqs[e.AssetID] = nil
+			doneDue[e.AssetID] = map[int]string{}
+			continue
+		}
 		if e.Kind == eventPlanRevoke {
-			// 目标须为先前同资产的完成履历（更晚序号的完成此时尚未出现），
+			// 目标须为当前段内先前的完成履历（更晚序号的完成此时尚未出现），
 			// 未撤销且为当时最新有效；撤销后下一到期日恢复为其周期到期日。
 			due, ok := doneDue[e.AssetID][e.TargetSeq]
 			if !ok {
+				if allDone[e.AssetID][e.TargetSeq] {
+					return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 属于资产 %s 调整前的旧方案段，旧段完成不能再撤销",
+						e.Seq, e.TargetSeq, e.AssetID)
+				}
 				return fmt.Errorf("履历矛盾：保养撤销履历（序号 %d）的目标序号 %d 不是资产 %s 先前的完成履历",
 					e.Seq, e.TargetSeq, e.AssetID)
 			}
@@ -1063,6 +1162,7 @@ func validateData(d *storeData) error {
 					e.Seq, e.TargetSeq, latest)
 			}
 			revokedDone[e.TargetSeq] = true
+			delete(validDoneDay[e.AssetID], e.TargetSeq)
 			derivedDue[e.AssetID] = due
 			continue
 		}
@@ -1074,9 +1174,9 @@ func validateData(d *storeData) error {
 			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）周期到期日 %s 与当前下一到期日 %s 不接续",
 				e.AssetID, e.Seq, e.Due, derivedDue[e.AssetID])
 		}
-		first, _ := parseDate(p.FirstDue)
+		first, _ := parseDate(segFirst[e.AssetID])
 		done, _ := parseDate(e.Done)
-		next, ok := nextDueAfter(first, int64(p.IntervalDays), done)
+		next, ok := nextDueAfter(first, int64(segInterval[e.AssetID]), done)
 		if !ok {
 			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）无法推出日期范围内的下一到期日",
 				e.AssetID, e.Seq)
@@ -1087,10 +1187,23 @@ func validateData(d *storeData) error {
 			doneDue[e.AssetID] = map[int]string{}
 		}
 		doneDue[e.AssetID][e.Seq] = e.Due
+		if allDone[e.AssetID] == nil {
+			allDone[e.AssetID] = map[int]bool{}
+		}
+		allDone[e.AssetID][e.Seq] = true
+		if validDoneDay[e.AssetID] == nil {
+			validDoneDay[e.AssetID] = map[int]int64{}
+		}
+		validDoneDay[e.AssetID][e.Seq] = done
 	}
 	for _, p := range d.Plans {
 		if maintCreate[p.AssetID] == 0 {
 			return fmt.Errorf("履历矛盾：资产 %s 的保养计划应有恰一条建立履历，实际没有", p.AssetID)
+		}
+		if segContent[p.AssetID] != p.Content || segFirst[p.AssetID] != p.FirstDue || segInterval[p.AssetID] != p.IntervalDays {
+			return fmt.Errorf("履历矛盾：按履历推出资产 %s 的当前方案（内容 %q、首次到期日 %s、每 %d 天）与保存的方案（内容 %q、首次到期日 %s、每 %d 天）不符",
+				p.AssetID, segContent[p.AssetID], segFirst[p.AssetID], segInterval[p.AssetID],
+				p.Content, p.FirstDue, p.IntervalDays)
 		}
 		if derivedDue[p.AssetID] != p.NextDue {
 			return fmt.Errorf("履历矛盾：按履历推出资产 %s 的下一到期日为 %s，与保存的 %s 不符",

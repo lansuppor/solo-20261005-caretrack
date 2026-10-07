@@ -33,6 +33,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   deactivate 停用“可用”且无未关闭工单的资产（记录理由，不创建工单）
   reactivate 恢复使用已停用的资产（记录理由，历史记录保留）
   plan       为资产建立唯一的周期保养计划（不可覆盖）
+  adjust     调整已有计划的保养方案（更换内容、周期起点与间隔，保留原保养记录）
   maintain   登记当前周期的保养完成，推进下一到期日，显示完成履历序号
   unmaintain 按完成履历序号撤销误登记的保养完成，恢复下一到期日
   due        按指定日期列出到期的保养计划（只读）
@@ -40,7 +41,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   return     按领用编号退回备件（允许多次部分退回）
   attach     为工单登记本地资料附件索引（只保存引用，不复制文件）
   revoke     按附件编号撤销附件索引（保留记录、路径、说明与理由）
-  history    按资产查看履历（报修、派工、关闭、取消、停用、恢复使用、保养建立、完成与撤销、备件领用与退回、附件登记与撤销事件）
+  history    按资产查看履历（报修、派工、关闭、取消、停用、恢复使用、保养建立、完成、撤销与调整、备件领用与退回、附件登记与撤销事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
   import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划、备件记录与附件索引（复制，源只读）
   help       显示本帮助
@@ -60,6 +61,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   reactivate --asset-id 编号 --reason 恢复理由                [--data-dir 目录]
   plan     --asset-id 编号 --content 保养内容 --first-due 首次到期日
            --interval-days 间隔天数                           [--data-dir 目录]
+  adjust   --asset-id 编号 --content 新保养内容 --first-due 新首次到期日
+           --interval-days 新间隔天数 --reason 调整理由      [--data-dir 目录]
   maintain --asset-id 编号 --due 周期到期日 --done 实际完成日 --result 结果
                                                               [--data-dir 目录]
   unmaintain --asset-id 编号 --seq 完成履历序号 --reason 理由  [--data-dir 目录]
@@ -121,8 +124,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     理由非空，成功后恢复“可用”并同样追加履历；历史记录不因恢复而删除。
   - 停用期间拒绝新报修与保养完成登记：被拒绝的新报修不绑定新请求标识，恢复使用
     后可用同一标识重试；已有报修请求的相同重放即使资产停用仍返回原工单及当前
-    状态，不开单、不改资产状态，冲突请求仍拒绝。停用资产仍可建立保养计划、按
-    原规则撤销已登记完成；停用本身不改变保养内容、间隔或下一到期日，不暂停或
+    状态，不开单、不改资产状态，冲突请求仍拒绝。停用资产仍可建立保养计划、调整
+    保养方案、按原规则撤销已登记完成；停用本身不改变保养内容、间隔或下一到期日，不暂停或
     重算周期，detail 仍展示计划，due 排除停用资产；恢复后按保存的下一到期日
     参与到期查询，逾期计划仍显示原到期日，随后完成沿用原推进规则。终态工单在
     停用期间仍可补充、撤销附件；维修停机统计仍只计算工单占用，停用区间不计入。
@@ -130,6 +133,16 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     0001 至 9999 年的有效公历日期（YYYY-MM-DD），间隔天数为正整数；日期按日历日
     运算，不受时区与运行时刻影响。未知资产或已有计划时拒绝。资产详情显示保养
     内容、间隔与下一到期日，无计划时明确提示。
+  - adjust 调整已有计划的保养方案：输入资产编号、新保养内容、新首次到期日、
+    新间隔天数与非空调整理由；仅已有计划的资产可调整，维修中、停用时也允许。
+    内容非空，日期与间隔规则同 plan；新首次到期日须严格晚于该资产所有未撤销
+    完成的实际完成日，没有有效完成则无此限制。未知资产、无计划或不合法输入
+    拒绝。成功采用新方案，下一到期日设为新首次到期日，输出新方案与日期，不补
+    任何完成记录；追加一条记录前后方案、原下一到期日、理由与时间的资产级履历。
+    建立与每次调整以各自的全库履历序号划分方案段（不按日期或数组位置）：
+    maintain 只完成当前段下一周期，按本段首次日加整数倍间隔推进；unmaintain
+    只能撤销当前段最新有效完成，旧段完成不能再撤销。调整不改变资产状态、
+    工单、请求绑定或停机统计；detail、due 采用当前方案。
   - maintain 登记当前周期的保养完成：--due 所填周期到期日必须等于当前下一到期日
     （旧周期不能重复登记，也不能登记尚未到期的新周期），--done 实际完成日不得早于
     周期到期日，--result 结果非空；无计划时拒绝。成功后记录一次实际保养，下一到期
@@ -138,17 +151,19 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     拒绝。输出完成周期、完成履历的全库序号与下一到期日。
   - unmaintain 撤销误登记的保养完成：--seq 为目标完成履历的全库序号（完成身份以此
     序号标识，不能用到期日或报修请求标识代替），--reason 理由非空。仅可撤销该资产
-    按序号最新的未撤销完成：存在更晚有效完成时拒绝；未知资产或序号、目标不是该
-    资产的完成、重复撤销均失败。成功保留原完成的日期、结果与时间，追加一条含目标
-    序号、理由与操作时间的撤销履历，并把下一到期日恢复为该完成的周期到期日（延期
-    跨过的周期不补记录）；输出目标序号与恢复的日期。撤销后可继续撤销此前最新有效
-    完成，维修或其他资产事件不阻止操作。恢复的周期可按原 maintain 规则重新完成，
+    当前方案段内按序号最新的未撤销完成：存在更晚有效完成时拒绝；调整前旧段的完成
+    不能再撤销；未知资产或序号、目标不是该资产的完成、重复撤销均失败。成功保留原
+    完成的日期、结果与时间，追加一条含目标序号、理由与操作时间的撤销履历，并把
+    下一到期日恢复为该完成的周期到期日（延期跨过的周期不补记录）；输出目标序号与
+    恢复的日期。撤销后可继续撤销本段此前最新有效完成，维修或其他资产事件不阻止
+    操作。恢复的周期可按原 maintain 规则重新完成，
     生成新序号；旧序号的再次撤销仍被拒绝，不会误撤销新登记。detail、due 反映回退。
   - due 为只读查询：列出下一到期日不晚于 --date 的保养计划，显示资产编号、名称、
     保养内容和到期日，按到期日再按资产编号排序；无匹配明确提示。不写文件、不
     初始化目录、不推进计划。
   - 每个保养计划恰有一条含初始计划的建立履历，完成履历含周期到期日、实际完成日
-    和结果，撤销履历含目标完成履历序号与理由；保养履历与维修履历按全库唯一履历
+    和结果，撤销履历含目标完成履历序号与理由，调整履历含前后方案、原下一到期日
+    与理由；保养履历与维修履历按全库唯一履历
     序号共同展示操作时间及内容，history 中各次完成显示其序号及有效或已撤销状态。
     维修中资产也可建立计划、登记完成与撤销：保养不创建或终结工单、不消耗工单
     编号，不改变资产状态、请求绑定或停机统计。
@@ -202,8 +217,9 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     同步替换，路径、状态、说明与理由保持，不复制资料文件，文件不可用不使导入
     失败；数量、时间精度与操作顺序保持。
     履历在目标最大履历序号之后按源序号顺序分配新序号，保留原操作顺序与原时间
-    （含小数秒）。保养计划与保养履历（含撤销履历）原样复制，内容、日期、完成与
-    撤销链接续，撤销履历中的目标完成序号随履历重编号同步替换，并输出完成履历
+    （含小数秒）。保养计划与保养履历（含撤销与调整履历）原样复制，内容、日期、
+    完成与撤销链接续，方案段边界、顺序与时间精度保持，撤销履历中的目标完成序号
+    随履历重编号同步替换，并输出完成履历
     序号的原、新映射；目标已有计划不变。资产编号在目标已存在、或所选工单的任一
     请求标识已在目标绑定时整批拒绝，不覆盖、不合并。导入后可用原请求标识、资产
     与描述重放报修，返回映射后的工单及其当前状态，也可用新完成序号继续撤销；
@@ -268,6 +284,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdReactivate(args[1:], stdout)
 	case "plan":
 		err = cmdPlan(args[1:], stdout)
+	case "adjust":
+		err = cmdAdjust(args[1:], stdout)
 	case "maintain":
 		err = cmdMaintain(args[1:], stdout)
 	case "unmaintain":
@@ -789,6 +807,60 @@ func cmdPlan(args []string, w io.Writer) error {
 	return nil
 }
 
+// cmdAdjust 调整已有计划的保养方案：更换内容、周期起点与间隔，保留原保养记录。
+// 日期与间隔的参数错误为退出码 2；未知资产、无计划等业务失败为退出码 1。
+func cmdAdjust(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var assetID, content, firstDue, reason string
+	var interval int
+	fs := newFlagSet("adjust", &opts)
+	fs.StringVar(&assetID, "asset-id", "", "企业资产编号（必填，须已有保养计划）")
+	fs.StringVar(&content, "content", "", "新保养内容（必填，非空）")
+	fs.StringVar(&firstDue, "first-due", "", "新首次到期日（必填，YYYY-MM-DD，0001 至 9999 年的有效公历日期）")
+	fs.IntVar(&interval, "interval-days", 0, "新保养间隔天数（必填，正整数）")
+	fs.StringVar(&reason, "reason", "", "调整理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, assetID, "asset-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, content, "content"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, firstDue, "first-due"); err != nil {
+		return err
+	}
+	if _, err := parseDate(firstDue); err != nil {
+		return &usageError{msg: fmt.Sprintf("--first-due 无效：%s", err)}
+	}
+	if interval < 1 {
+		return &usageError{msg: "--interval-days 须为正整数"}
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	p, old, err := s.adjustPlan(assetID, content, firstDue, interval, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "已调整资产 %s 的保养方案。\n", p.AssetID)
+	fmt.Fprintf(w, "原方案: %s（首次到期日 %s，每 %d 天）\n", old.Content, old.FirstDue, old.IntervalDays)
+	fmt.Fprintf(w, "保养内容: %s\n", p.Content)
+	fmt.Fprintf(w, "保养间隔: 每 %d 天\n", p.IntervalDays)
+	fmt.Fprintf(w, "首次到期日: %s\n", p.FirstDue)
+	fmt.Fprintf(w, "下一到期日: %s\n", p.NextDue)
+	return nil
+}
+
 // cmdMaintain 登记当前周期的保养完成并推进下一到期日。
 func cmdMaintain(args []string, w io.Writer) error {
 	var opts cmdOptions
@@ -1126,6 +1198,10 @@ func cmdHistory(args []string, w io.Writer) error {
 		case eventPlanRevoke:
 			fmt.Fprintf(w, "[%s] %s: 目标完成履历序号 %d（%s）\n",
 				ts, e.Kind, e.TargetSeq, e.Content)
+		case eventPlanAdjust:
+			fmt.Fprintf(w, "[%s] %s: %s（内容 %s -> %s，首次到期日 %s -> %s，每 %d 天 -> 每 %d 天，原下一到期日 %s）\n",
+				ts, e.Kind, e.Content, e.OldContent, e.NewContent, e.OldDue, e.Due,
+				e.OldInterval, e.Interval, e.OldNextDue)
 		case eventPartWithdraw, eventPartReturn:
 			fmt.Fprintf(w, "[%s] %s 工单 %s: 领用编号 %s，备件 %s，数量 %d（%s）\n",
 				ts, e.Kind, e.TicketID, e.WithdrawalID, e.PartID, e.Quantity, e.Content)
