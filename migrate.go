@@ -534,9 +534,45 @@ func verifyPackage(zr *zip.Reader) (*storeData, map[string]string, map[string][]
 	return d, attachMember, contents, nil
 }
 
+// restoreFaults 为还原流程的内部测试接缝：默认全部为 nil，restore 执行
+// 与生产完全一致的真实文件系统操作。各字段仅在测试中被临时替换为在对应
+// 读写点确定性返回（可恢复）故障的钩子；故障只针对指定操作本身，清理
+// （RemoveAll 等）不经接缝、始终正常执行。这里没有任何用户可见开关，
+// 钩子也不得直接让命令入口报错或代替真实还原。
+var restoreFaults = struct {
+	// mkdirAttach 在暂存目录内创建资料子目录时调用；返回非 nil 即模拟
+	// “创建资料目录失败”。
+	mkdirAttach func(path string, perm os.FileMode) error
+	// stagedWrite 在暂存目录内原子写入台账或资料副本时调用：钩子接收
+	// 目标最终路径与待写内容，可先向临时文件写入部分真实字节再返回错误，
+	// 以模拟写入中途失败。返回非 nil 时临时文件与暂存目录照常被清理。
+	stagedWrite func(path string, data []byte) error
+	// precheckLoad 在发布前于暂存目录复核台账时调用，返回非 nil 即模拟
+	// “暂存台账复核失败”（此时台账与全部资料副本确已写好）。签名与
+	// loadStore 一致；还原固定以 allowMissing=false 调用。
+	precheckLoad func(dir string, allowMissing bool) (*store, error)
+	// publishRename 在把暂存目录整体改名为目标目录时调用，返回非 nil 即
+	// 模拟“发布目标目录失败”。
+	publishRename func(oldpath, newpath string) error
+	// postcheckOpen 在发布后重新打开目标目录做复核时调用，返回非 nil 即
+	// 模拟“还原后复核失败”（此时目标目录确已发布，须被清除）。
+	postcheckOpen func(dir string) (*store, error)
+}{}
+
 // writeAtomicFile 在 dir 下经临时文件 + rename 原子写入一个普通文件，
 // 权限 0644；失败由调用方负责清理暂存目录。
 func writeAtomicFile(path string, data []byte) error {
+	if restoreFaults.stagedWrite != nil {
+		if err := restoreFaults.stagedWrite(path, data); err != nil {
+			return err
+		}
+	}
+	return writeAtomicFileReal(path, data)
+}
+
+// writeAtomicFileReal 执行真实的临时文件 + rename 原子写入。测试钩子在让
+// 非故障写入走真实流程时直接调用本函数，保证此前各份副本确已真实落盘。
+func writeAtomicFileReal(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".caretrack-restore-*.tmp")
 	if err != nil {
@@ -662,7 +698,11 @@ func restorePackage(packagePath, targetDir string) (*restoreOutcome, error) {
 		_ = os.RemoveAll(absTarget)
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(stage, restoreAttachDir), 0o755); err != nil {
+	mkdirAttach := os.MkdirAll
+	if restoreFaults.mkdirAttach != nil {
+		mkdirAttach = restoreFaults.mkdirAttach
+	}
+	if err := mkdirAttach(filepath.Join(stage, restoreAttachDir), 0o755); err != nil {
 		return abort(fmt.Errorf("创建资料目录失败: %w", err))
 	}
 	if err := writeAtomicFile(filepath.Join(stage, dataFileName), ledger); err != nil {
@@ -679,7 +719,11 @@ func restorePackage(packagePath, targetDir string) (*restoreOutcome, error) {
 	}
 	// 发布前在暂存目录内复核：台账可加载且业务自洽，每份资料为与包内一致的
 	// 普通文件（内容校验值相符）。
-	checkStore, err := loadStore(stage, false)
+	loadStagedStore := loadStore
+	if restoreFaults.precheckLoad != nil {
+		loadStagedStore = restoreFaults.precheckLoad
+	}
+	checkStore, err := loadStagedStore(stage, false)
 	if err != nil {
 		return abort(fmt.Errorf("暂存台账复核失败: %w", err))
 	}
@@ -695,12 +739,20 @@ func restorePackage(packagePath, targetDir string) (*restoreOutcome, error) {
 		}
 	}
 	// 整体发布：暂存目录原子改名为目标目录。
-	if err := os.Rename(stage, absTarget); err != nil {
+	publishRename := os.Rename
+	if restoreFaults.publishRename != nil {
+		publishRename = restoreFaults.publishRename
+	}
+	if err := publishRename(stage, absTarget); err != nil {
 		return abort(fmt.Errorf("发布目标目录失败: %w", err))
 	}
 	// 发布后再复核一次：台账可加载、资料副本为可读普通文件。全部就绪后才
 	// 向调用方报告成功；失败则移除目标目录。
-	final, err := openSourceStore(absTarget)
+	openFinalStore := openSourceStore
+	if restoreFaults.postcheckOpen != nil {
+		openFinalStore = restoreFaults.postcheckOpen
+	}
+	final, err := openFinalStore(absTarget)
 	if err != nil {
 		_ = os.RemoveAll(absTarget)
 		return nil, fmt.Errorf("还原后复核失败: %w", err)
