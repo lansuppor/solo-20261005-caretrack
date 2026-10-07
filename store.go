@@ -30,6 +30,7 @@ const (
 
 	eventDeactivate = "停用"
 	eventReactivate = "恢复使用"
+	eventRelocate   = "位置变更"
 
 	eventPlanCreate = "保养建立"
 	eventPlanDone   = "保养完成"
@@ -60,26 +61,31 @@ type Asset struct {
 }
 
 // Ticket 为维修工单。Assignee 为当前（或终结前最后）负责人，空表示未派工；
-// AssignedAt/AssignNote 为最近一次派工的变更时间与说明。
+// AssignedAt/AssignNote 为最近一次派工的变更时间与说明。ReportLocation 为
+// 报修履历序号当时的资产位置（报修地点）：在报修时确定，之后的位置变更不
+// 改写它，也不能用当前位置、履历时间或数组位置代替；旧库以登记时保存的
+// 位置作为起点，无需转换。
 type Ticket struct {
-	ID           string `json:"id"`
-	AssetID      string `json:"asset_id"`
-	Description  string `json:"description"`
-	RequestID    string `json:"request_id"`
-	Status       string `json:"status"`
-	Result       string `json:"result,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	ClosedAt     string `json:"closed_at,omitempty"`
-	CancelReason string `json:"cancel_reason,omitempty"`
-	CancelledAt  string `json:"cancelled_at,omitempty"`
-	Assignee     string `json:"assignee,omitempty"`
-	AssignedAt   string `json:"assigned_at,omitempty"`
-	AssignNote   string `json:"assign_note,omitempty"`
+	ID             string `json:"id"`
+	AssetID        string `json:"asset_id"`
+	Description    string `json:"description"`
+	RequestID      string `json:"request_id"`
+	Status         string `json:"status"`
+	Result         string `json:"result,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	ClosedAt       string `json:"closed_at,omitempty"`
+	CancelReason   string `json:"cancel_reason,omitempty"`
+	CancelledAt    string `json:"cancelled_at,omitempty"`
+	Assignee       string `json:"assignee,omitempty"`
+	AssignedAt     string `json:"assigned_at,omitempty"`
+	AssignNote     string `json:"assign_note,omitempty"`
+	ReportLocation string `json:"report_location,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消/停用/恢复使用/保养建立/保养完成/保养撤销/保养调整/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/派工/关闭/取消/停用/恢复使用/位置变更/保养建立/保养完成/保养撤销/保养调整/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
 // From/To 在派工履历中为原负责人（首次派工为空，展示为“未派工”）与新负责人；
-// 在停用、恢复使用履历中为原资产状态与新资产状态。
+// 在停用、恢复使用履历中为原资产状态与新资产状态；
+// 在位置变更履历中为原位置与新位置（资产级履历，不属于任何工单）。
 // Due/Done/Interval 仅保养履历使用：建立履历含首次到期日（Due）与间隔天数
 // （Interval），完成履历含周期到期日（Due）与实际完成日（Done）。
 // TargetSeq 仅保养撤销履历使用：被撤销的完成履历的全库序号；完成身份以此序号
@@ -698,6 +704,31 @@ func validateData(d *storeData) error {
 			}
 			continue
 		}
+		if e.Kind == eventRelocate {
+			// 位置变更为资产级履历：不属于任何工单，From/To 为原位置与新位置，
+			// 新位置非空且与原位置不同，不携带派工、保养、备件或附件字段。
+			// 位置链接续（原位置须等于当时位置）与最终位置一致性在下方按履历
+			// 序号重放时核对。
+			if e.TicketID != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录不应带有工单编号", e.Seq)
+			}
+			if e.From == "" || e.To == "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录缺少原位置或新位置", e.Seq)
+			}
+			if e.From == e.To {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录新位置与原位置相同", e.Seq)
+			}
+			if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 ||
+				e.NewContent != "" || e.OldContent != "" || e.OldDue != "" || e.OldInterval != 0 || e.OldNextDue != "" ||
+				e.PartID != "" || e.Quantity != 0 || e.WithdrawalID != "" ||
+				e.AttachmentID != "" || e.Path != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的位置变更记录不应带有保养、备件或附件字段", e.Seq)
+			}
+			if assets[e.AssetID] == nil {
+				return fmt.Errorf("位置矛盾：履历序号 %d 的位置变更记录引用了不存在的资产", e.Seq)
+			}
+			continue
+		}
 		if e.TicketID == "" {
 			return errors.New("履历矛盾：存在字段不完整的履历记录")
 		}
@@ -816,6 +847,30 @@ func validateData(d *storeData) error {
 	sorted := make([]Event, len(d.Events))
 	copy(sorted, d.Events)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
+	// 位置链：每项资产的位置起点为最早一条位置变更履历（按全库序号）的原位置；
+	// 没有位置履历的资产以保存位置为起点。重放时原位置须接续当时位置、新位置
+	// 非空且不同，报修地点取报修履历序号当时的位置。
+	locationOrigin := map[string]string{}
+	relocateExists := map[string]bool{}
+	for _, a := range d.Assets {
+		locationOrigin[a.ID] = a.Location
+	}
+	minRelocateSeq := map[string]int{}
+	for _, e := range d.Events {
+		if e.Kind != eventRelocate {
+			continue
+		}
+		if !relocateExists[e.AssetID] || e.Seq < minRelocateSeq[e.AssetID] {
+			relocateExists[e.AssetID] = true
+			minRelocateSeq[e.AssetID] = e.Seq
+			locationOrigin[e.AssetID] = e.From
+		}
+	}
+	derivedLocation := map[string]string{}
+	for id, origin := range locationOrigin {
+		derivedLocation[id] = origin
+	}
+	ticketReportLocation := map[string]string{}
 	derivedTicket := map[string]string{}
 	derivedOpen := map[string]string{}
 	derivedDeactivated := map[string]bool{}
@@ -839,8 +894,19 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：资产 %s 在停用期间产生了工单 %s 的报修",
 					e.AssetID, e.TicketID)
 			}
+			// 报修地点取该报修履历序号当时的资产位置：不能用当前地点、履历
+			// 时间或数组位置代替。
+			ticketReportLocation[e.TicketID] = derivedLocation[e.AssetID]
 			derivedTicket[e.TicketID] = ticketOpen
 			derivedOpen[e.AssetID] = e.TicketID
+		case eventRelocate:
+			// 原位置须接续当时位置；新位置非空且与原位置不同（非空与不同已在
+			// 上方逐条核对）。可用、维修中、停用资产均可变更，不影响工单占用。
+			if e.From != derivedLocation[e.AssetID] {
+				return fmt.Errorf("位置矛盾：资产 %s 的位置变更履历（序号 %d）原位置 %q 与当时位置 %q 不接续",
+					e.AssetID, e.Seq, e.From, derivedLocation[e.AssetID])
+			}
+			derivedLocation[e.AssetID] = e.To
 		case eventDeactivate:
 			// 停用要求当时“可用”（无未关闭工单且未停用）；维修中（有未关闭
 			// 工单）的资产不能停用。From/To 须与实际转换一致。
@@ -1031,6 +1097,22 @@ func validateData(d *storeData) error {
 		if a.Status != want {
 			return fmt.Errorf("状态矛盾：按履历推进得到资产 %s 状态为 %s，与保存的 %s 不符",
 				a.ID, want, a.Status)
+		}
+	}
+	// 位置链终检：按履历序号重放得到的最终位置须与资产保存位置一致。
+	for _, a := range d.Assets {
+		if derivedLocation[a.ID] != a.Location {
+			return fmt.Errorf("位置矛盾：按履历推进得到资产 %s 当前位置为 %q，与保存的 %q 不符",
+				a.ID, derivedLocation[a.ID], a.Location)
+		}
+	}
+	// 工单保存的报修地点须与按报修履历序号追溯到的当时资产位置一致；
+	// 缺少该字段的有效旧库工单不补写，查询时现场追溯（已保证起点非空）。
+	for _, t := range d.Tickets {
+		got := ticketReportLocation[t.ID]
+		if t.ReportLocation != "" && t.ReportLocation != got {
+			return fmt.Errorf("位置矛盾：工单 %s 保存的报修地点 %q 与报修履历序号当时的资产位置 %q 不符",
+				t.ID, t.ReportLocation, got)
 		}
 	}
 	// 保养计划：归属存在的资产、每项资产最多一个、日期有效、间隔为正整数。
@@ -1325,6 +1407,9 @@ func (s *store) report(assetID, description, requestID string) (*Ticket, bool, e
 		RequestID:   requestID,
 		Status:      ticketOpen,
 		CreatedAt:   s.now().Format(time.RFC3339),
+		// 报修地点在报修时按当时资产位置确定；之后位置变更不改写本字段，
+		// 由加载/保存校验保证它与按报修履历序号追溯的位置一致。
+		ReportLocation: asset.Location,
 	}
 	s.data.NextTicketSeq = seq + 1
 	s.data.Tickets = append(s.data.Tickets, t)

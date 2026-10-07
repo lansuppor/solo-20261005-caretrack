@@ -32,6 +32,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
   deactivate 停用“可用”且无未关闭工单的资产（记录理由，不创建工单）
   reactivate 恢复使用已停用的资产（记录理由，历史记录保留）
+  move      变更设备位置（可用、维修中、停用资产均可，记录原位置、新位置与理由）
   plan       为资产建立唯一的周期保养计划（不可覆盖）
   adjust     调整已有计划的保养方案（更换内容、周期起点与间隔，保留原保养记录）
   maintain   登记当前周期的保养完成，推进下一到期日，显示完成履历序号
@@ -41,7 +42,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   return     按领用编号退回备件（允许多次部分退回）
   attach     为工单登记本地资料附件索引（只保存引用，不复制文件）
   revoke     按附件编号撤销附件索引（保留记录、路径、说明与理由）
-  history    按资产查看履历（报修、派工、关闭、取消、停用、恢复使用、保养建立、完成、撤销与调整、备件领用与退回、附件登记与撤销事件）
+  history    按资产查看履历（报修、派工、关闭、取消、停用、恢复使用、位置变更、保养建立、完成、撤销与调整、备件领用与退回、附件登记与撤销事件）
   downtime   查询时间窗口内的设备维修停机时长（单项或全部资产）
   import     从另一数据目录批量导入资产及其工单、履历、请求绑定、保养计划、备件记录与附件索引（复制，源只读）
   help       显示本帮助
@@ -59,6 +60,8 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   deactivate --asset-id 编号 --reason 停用理由                [--data-dir 目录]
   reactivate --asset-id 编号 --reason 恢复理由                [--data-dir 目录]
+  move      --asset-id 编号 --location 新位置 --reason 变更理由
+                                                              [--data-dir 目录]
   plan     --asset-id 编号 --content 保养内容 --first-due 首次到期日
            --interval-days 间隔天数                           [--data-dir 目录]
   adjust   --asset-id 编号 --content 新保养内容 --first-due 新首次到期日
@@ -129,6 +132,24 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     重算周期，detail 仍展示计划，due 排除停用资产；恢复后按保存的下一到期日
     参与到期查询，逾期计划仍显示原到期日，随后完成沿用原推进规则。终态工单在
     停用期间仍可补充、撤销附件；维修停机统计仍只计算工单占用，停用区间不计入。
+  - move 变更设备位置：输入资产编号、新位置与非空理由，可用、维修中、停用
+    资产均可变更；未知资产、空位置或理由、新位置与当前位置相同均拒绝。成功
+    显示资产编号、原位置与新位置，更新当前位置，追加一条含原位置、新位置、
+    理由、时间与全库序号的资产级履历。位置变更不改变资产状态、工单状态、
+    负责人、请求绑定、保养周期、备件、附件及停机统计。每张工单的报修地点
+    取该工单报修履历序号当时的资产位置，不能用当前地点、履历时间或数组位置
+    代替：维修中搬移不改旧单报修地点，搬移后新报修采用新地点；旧请求重放
+    仍返回原工单，不改地点也不追加履历，ticket 查询显示报修地点。首次变更
+    前的位置在重载后仍可还原（以最早一条位置变更履历的原位置为起点）；没有
+    位置履历的有效旧库以保存位置作为起点，无需转换，查询不补写数据、不
+    初始化目录。加载和保存按履历序号核对位置链：归属资产存在，原位置
+    接续当时位置，新位置非空且不同，最终位置与资产保存值一致；数组乱序、
+    序号间隔、时间不递增仍合法，位置矛盾时所有读写命令退出 1 并说明类别，
+    原文件不变，不自动修复。变更为一次原子保存：校验、履历容量不足或读写
+    失败不留部分位置或履历、不消耗序号，原文件字节保持，恢复后可按原输入
+    重试。import 一并复制所选资产的位置起点、当前位置和全部位置履历，沿用
+    履历重编号，保留先后关系、理由和时间精度；导入不新增搬移事件，源只读，
+    目标原有记录不变，导入后的工单报修地点保持，资产可继续变更位置。
   - 每项资产最多一个周期保养计划，建立后不可覆盖：保养内容非空，首次到期日为
     0001 至 9999 年的有效公历日期（YYYY-MM-DD），间隔天数为正整数；日期按日历日
     运算，不受时区与运行时刻影响。未知资产或已有计划时拒绝。资产详情显示保养
@@ -207,8 +228,11 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     时统计全部资产并按编号字典序排列，空库明确提示无记录并显示零合计。若所选
     资产任一终结工单的结束履历时间早于报修履历时间（即使该单在窗口外、结束
     等于开始合法），整次统计失败，指出资产与工单，不输出部分结果。
-  - import 把源数据目录中所选资产连同全部工单、报修请求绑定、履历、保养计划、
-    备件领用记录与附件索引复制到目标目录（--data-dir）：连同停用、恢复使用履历
+  - import 把源数据目录中所选资产连同全部工单、报修请求绑定、履历（含位置
+    变更履历）、保养计划、备件领用记录与附件索引复制到目标目录（--data-dir）：
+    位置起点（最早一条位置变更履历的原位置，没有位置履历则为保存位置）、
+    当前位置与全部位置履历一并复制并沿用履历重编号，保留先后关系、理由与
+    时间精度；连同停用、恢复使用履历
     与当前停用/可用状态一并复制，导入后可继续停用或恢复：源台账始终只读，同一台账
     不能导入自身；重复编号按一项处理。工单编号按源工单序号升序从目标下一序号重新
     分配，履历与请求绑定中的工单引用同步替换；领用编号按源领用履历序号整体排序后从
@@ -282,6 +306,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdDeactivate(args[1:], stdout)
 	case "reactivate":
 		err = cmdReactivate(args[1:], stdout)
+	case "move":
+		err = cmdMove(args[1:], stdout)
 	case "plan":
 		err = cmdPlan(args[1:], stdout)
 	case "adjust":
@@ -581,6 +607,9 @@ func cmdTicket(args []string, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "工单编号: %s\n", t.ID)
 	fmt.Fprintf(w, "资产编号: %s\n", t.AssetID)
+	// 报修地点为报修履历序号当时的资产位置：维修中搬移不改本单地点，
+	// 旧库缺少该字段时按履历序号现场追溯，只读不补写。
+	fmt.Fprintf(w, "报修地点: %s\n", s.reportLocationOf(t))
 	fmt.Fprintf(w, "工单状态: %s\n", t.Status)
 	fmt.Fprintf(w, "负责人: %s\n", assigneeDisplay(t.Assignee))
 	if t.Assignee != "" {
@@ -756,6 +785,47 @@ func cmdReactivate(args []string, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "资产 %s 已恢复使用。\n", a.ID)
 	fmt.Fprintf(w, "当前状态: %s\n", a.Status)
+	return nil
+}
+
+// cmdMove 变更设备位置：输入资产编号、新位置与非空理由；可用、维修中、
+// 停用资产均可变更。成功显示资产编号、原位置与新位置；追加一条含原位置、
+// 新位置、理由、时间与全库序号的资产级履历。位置变更不改变资产状态、工单、
+// 负责人、请求绑定、保养周期、备件、附件及停机统计。
+func cmdMove(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var assetID, newLocation, reason string
+	fs := newFlagSet("move", &opts)
+	fs.StringVar(&assetID, "asset-id", "", "要变更位置的资产编号（必填；可用、维修中、停用资产均可变更）")
+	fs.StringVar(&newLocation, "location", "", "新位置（必填，须与当前位置不同）")
+	fs.StringVar(&reason, "reason", "", "位置变更理由（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, assetID, "asset-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, newLocation, "location"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, reason, "reason"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	a, from, err := s.relocateAsset(assetID, newLocation, reason)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "资产 %s 位置已变更。\n", a.ID)
+	fmt.Fprintf(w, "原位置: %s\n", from)
+	fmt.Fprintf(w, "新位置: %s\n", a.Location)
 	return nil
 }
 
@@ -1180,6 +1250,9 @@ func cmdHistory(args []string, w io.Writer) error {
 		ts := e.Time.Format("2006-01-02T15:04:05Z07:00")
 		switch e.Kind {
 		case eventDeactivate, eventReactivate:
+			fmt.Fprintf(w, "[%s] %s: %s -> %s（%s）\n",
+				ts, e.Kind, e.From, e.To, e.Content)
+		case eventRelocate:
 			fmt.Fprintf(w, "[%s] %s: %s -> %s（%s）\n",
 				ts, e.Kind, e.From, e.To, e.Content)
 		case eventAssign:
