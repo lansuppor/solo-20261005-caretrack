@@ -206,6 +206,10 @@ func (s *store) completePlan(assetID, due, done, result string) (*Plan, string, 
 	if p == nil {
 		return nil, "", 0, fmt.Errorf("%w: 资产 %s 没有保养计划", errNotFound, assetID)
 	}
+	if a := s.findAsset(assetID); a != nil && a.Status == statusDeactivated {
+		// 停用期间拒绝保养完成登记；停用不暂停或重算周期，保存的下一到期日不变。
+		return nil, "", 0, fmt.Errorf("%w: 资产 %s 已停用，不能登记保养完成", errConflict, assetID)
+	}
 	if result == "" {
 		return nil, "", 0, fmt.Errorf("%w: 保养结果不能为空", errConflict)
 	}
@@ -320,6 +324,8 @@ type duePlanRow struct {
 }
 
 // duePlans 列出下一到期日不晚于 date 的保养计划，按到期日再按资产编号排序。
+// 停用资产不参与到期查询：停用不暂停或重算周期，保存的下一到期日保持不变，
+// 恢复使用后仍按该日期参与查询，逾期计划显示原到期日。
 // 只读：不写文件、不初始化目录、不推进计划。date 须为有效日期（调用方校验）。
 func (s *store) duePlans(date string) []duePlanRow {
 	rows := make([]duePlanRow, 0)
@@ -331,6 +337,9 @@ func (s *store) duePlans(date string) []duePlanRow {
 		a := s.findAsset(p.AssetID)
 		if a == nil {
 			continue // 整库一致性检查已保证归属；防御性跳过
+		}
+		if a.Status == statusDeactivated {
+			continue
 		}
 		rows = append(rows, duePlanRow{AssetID: p.AssetID, Name: a.Name, Content: p.Content, Due: p.NextDue})
 	}

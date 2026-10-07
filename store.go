@@ -16,16 +16,20 @@ import (
 
 // 资产状态、工单状态与履历类型。
 const (
-	statusAvailable = "可用"
-	statusRepairing = "维修中"
-	ticketOpen      = "未关闭"
-	ticketClosed    = "已关闭"
-	ticketCancelled = "已取消"
+	statusAvailable   = "可用"
+	statusRepairing   = "维修中"
+	statusDeactivated = "停用"
+	ticketOpen        = "未关闭"
+	ticketClosed      = "已关闭"
+	ticketCancelled   = "已取消"
 
 	eventReport = "报修"
 	eventClose  = "关闭"
 	eventCancel = "取消"
 	eventAssign = "派工"
+
+	eventDeactivate = "停用"
+	eventReactivate = "恢复使用"
 
 	eventPlanCreate = "保养建立"
 	eventPlanDone   = "保养完成"
@@ -72,8 +76,9 @@ type Ticket struct {
 	AssignNote   string `json:"assign_note,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消/保养建立/保养完成/保养撤销/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
-// From/To 仅派工履历使用：原负责人（首次派工为空，展示为“未派工”）与新负责人。
+// Event 为履历条目（报修/派工/关闭/取消/停用/恢复使用/保养建立/保养完成/保养撤销/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
+// From/To 在派工履历中为原负责人（首次派工为空，展示为“未派工”）与新负责人；
+// 在停用、恢复使用履历中为原资产状态与新资产状态。
 // Due/Done/Interval 仅保养履历使用：建立履历含首次到期日（Due）与间隔天数
 // （Interval），完成履历含周期到期日（Due）与实际完成日（Done）。
 // TargetSeq 仅保养撤销履历使用：被撤销的完成履历的全库序号；完成身份以此序号
@@ -357,7 +362,7 @@ func validateData(d *storeData) error {
 		if a == nil || a.ID == "" || a.Name == "" || a.Location == "" {
 			return errors.New("数据矛盾：存在字段不完整的资产记录")
 		}
-		if a.Status != statusAvailable && a.Status != statusRepairing {
+		if a.Status != statusAvailable && a.Status != statusRepairing && a.Status != statusDeactivated {
 			return fmt.Errorf("状态矛盾：资产 %s 状态无效 %q", a.ID, a.Status)
 		}
 		if assets[a.ID] != nil {
@@ -526,7 +531,9 @@ func validateData(d *storeData) error {
 			return fmt.Errorf("请求绑定矛盾：工单 %s 缺少对应的报修请求绑定", t.ID)
 		}
 	}
-	// 状态：每项资产最多一张未关闭工单，有则“维修中”，无则“可用”。
+	// 状态：每项资产最多一张未关闭工单，有则必须为“维修中”；无未关闭工单时
+	// 资产可为“可用”或“停用”，停用与否由停用、恢复使用履历链决定，在下方
+	// 按履历序号重放时核对。
 	openCount := map[string]int{}
 	for _, t := range d.Tickets {
 		if t.Status == ticketOpen {
@@ -538,13 +545,16 @@ func validateData(d *storeData) error {
 		if c > 1 {
 			return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未关闭工单，最多允许一张", a.ID, c)
 		}
-		want := statusAvailable
 		if c == 1 {
-			want = statusRepairing
+			if a.Status != statusRepairing {
+				return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未关闭工单，状态应为 %s，实际为 %s",
+					a.ID, c, statusRepairing, a.Status)
+			}
+			continue
 		}
-		if a.Status != want {
-			return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未关闭工单，状态应为 %s，实际为 %s",
-				a.ID, c, want, a.Status)
+		if a.Status != statusAvailable && a.Status != statusDeactivated {
+			return fmt.Errorf("状态矛盾：资产 %s 没有未关闭工单，状态应为 %s 或 %s，实际为 %s",
+				a.ID, statusAvailable, statusDeactivated, a.Status)
 		}
 	}
 	// 履历：序号全库唯一且为正整数；归属、内容与工单一致。
@@ -608,6 +618,26 @@ func validateData(d *storeData) error {
 				if done < due {
 					return fmt.Errorf("履历矛盾：履历序号 %d 的完成日早于周期到期日", e.Seq)
 				}
+			}
+			continue
+		}
+		if e.Kind == eventDeactivate || e.Kind == eventReactivate {
+			// 停用/恢复使用为资产级履历：不属于任何工单，From/To 为原状态与新
+			// 状态，不携带派工、保养、备件或附件字段。转换是否接续（可用->停用、
+			// 停用->可用）在下方按履历序号重放时核对。
+			if e.TicketID != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有工单编号", e.Seq, e.Kind)
+			}
+			if e.From == "" || e.To == "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录缺少原状态或新状态", e.Seq, e.Kind)
+			}
+			if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 ||
+				e.PartID != "" || e.Quantity != 0 || e.WithdrawalID != "" ||
+				e.AttachmentID != "" || e.Path != "" {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的%s记录不应带有保养、备件或附件字段", e.Seq, e.Kind)
+			}
+			if assets[e.AssetID] == nil {
+				return fmt.Errorf("履历矛盾：履历序号 %d 引用了不存在的资产", e.Seq)
 			}
 			continue
 		}
@@ -730,6 +760,7 @@ func validateData(d *storeData) error {
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
 	derivedTicket := map[string]string{}
 	derivedOpen := map[string]string{}
+	derivedDeactivated := map[string]bool{}
 	derivedAssignee := map[string]string{}
 	derivedNote := map[string]string{}
 	withdrawSeq := map[string]int{}
@@ -746,8 +777,41 @@ func validateData(d *storeData) error {
 				return fmt.Errorf("履历矛盾：资产 %s 的上一张工单 %s 尚未结束就产生了工单 %s 的报修",
 					e.AssetID, prev, e.TicketID)
 			}
+			if derivedDeactivated[e.AssetID] {
+				return fmt.Errorf("履历矛盾：资产 %s 在停用期间产生了工单 %s 的报修",
+					e.AssetID, e.TicketID)
+			}
 			derivedTicket[e.TicketID] = ticketOpen
 			derivedOpen[e.AssetID] = e.TicketID
+		case eventDeactivate:
+			// 停用要求当时“可用”（无未关闭工单且未停用）；维修中（有未关闭
+			// 工单）的资产不能停用。From/To 须与实际转换一致。
+			if derivedOpen[e.AssetID] != "" {
+				return fmt.Errorf("履历矛盾：资产 %s 在存在未关闭工单时出现停用履历（序号 %d）",
+					e.AssetID, e.Seq)
+			}
+			if derivedDeactivated[e.AssetID] {
+				return fmt.Errorf("履历矛盾：资产 %s 被重复停用（序号 %d）", e.AssetID, e.Seq)
+			}
+			if e.From != statusAvailable || e.To != statusDeactivated {
+				return fmt.Errorf("履历矛盾：停用履历（序号 %d）原状态应为 %s、新状态应为 %s，实际为 %s -> %s",
+					e.Seq, statusAvailable, statusDeactivated, e.From, e.To)
+			}
+			derivedDeactivated[e.AssetID] = true
+		case eventReactivate:
+			// 恢复使用只作用于停用资产；From/To 须与实际转换一致。
+			if !derivedDeactivated[e.AssetID] {
+				return fmt.Errorf("履历矛盾：资产 %s 未停用却出现恢复使用履历（序号 %d）", e.AssetID, e.Seq)
+			}
+			if derivedOpen[e.AssetID] != "" {
+				return fmt.Errorf("履历矛盾：资产 %s 恢复使用（序号 %d）时仍存在未关闭工单",
+					e.AssetID, e.Seq)
+			}
+			if e.From != statusDeactivated || e.To != statusAvailable {
+				return fmt.Errorf("履历矛盾：恢复使用履历（序号 %d）原状态应为 %s、新状态应为 %s，实际为 %s -> %s",
+					e.Seq, statusDeactivated, statusAvailable, e.From, e.To)
+			}
+			delete(derivedDeactivated, e.AssetID)
 		case eventAssign:
 			if derivedTicket[e.TicketID] != ticketOpen {
 				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现派工履历", e.TicketID)
@@ -900,7 +964,10 @@ func validateData(d *storeData) error {
 	}
 	for _, a := range d.Assets {
 		want := statusAvailable
-		if derivedOpen[a.ID] != "" {
+		switch {
+		case derivedDeactivated[a.ID]:
+			want = statusDeactivated
+		case derivedOpen[a.ID] != "":
 			want = statusRepairing
 		}
 		if a.Status != want {
@@ -941,7 +1008,18 @@ func validateData(d *storeData) error {
 	doneSeqs := map[string][]int{}
 	doneDue := map[string]map[int]string{}
 	revokedDone := map[int]bool{}
+	// 停用状态随全库履历序号推进：停用期间不得登记保养完成；停用不暂停、不
+	// 重算周期，因此建立、完成与撤销的接续规则本身不受影响。
+	deactivatedAt := map[string]bool{}
 	for _, e := range sorted {
+		switch e.Kind {
+		case eventDeactivate:
+			deactivatedAt[e.AssetID] = true
+			continue
+		case eventReactivate:
+			delete(deactivatedAt, e.AssetID)
+			continue
+		}
 		if e.Kind != eventPlanCreate && e.Kind != eventPlanDone && e.Kind != eventPlanRevoke {
 			continue
 		}
@@ -987,6 +1065,10 @@ func validateData(d *storeData) error {
 			revokedDone[e.TargetSeq] = true
 			derivedDue[e.AssetID] = due
 			continue
+		}
+		if e.Kind == eventPlanDone && deactivatedAt[e.AssetID] {
+			return fmt.Errorf("履历矛盾：资产 %s 在停用期间出现保养完成履历（序号 %d）",
+				e.AssetID, e.Seq)
 		}
 		if e.Due != derivedDue[e.AssetID] {
 			return fmt.Errorf("履历矛盾：资产 %s 的保养完成履历（序号 %d）周期到期日 %s 与当前下一到期日 %s 不接续",
@@ -1174,6 +1256,10 @@ func (s *store) report(assetID, description, requestID string) (*Ticket, bool, e
 	asset := s.findAsset(assetID)
 	if asset == nil {
 		return nil, false, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
+	}
+	if asset.Status == statusDeactivated {
+		// 停用期间拒绝新报修，也不绑定新请求标识；恢复使用后可用同一标识重试。
+		return nil, false, fmt.Errorf("%w: 资产 %s 已停用，不能报修", errConflict, assetID)
 	}
 	if t := s.openTicketOf(assetID); t != nil {
 		return nil, false, fmt.Errorf("%w: 资产 %s 已有未关闭工单 %s", errConflict, assetID, t.ID)
