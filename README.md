@@ -452,6 +452,41 @@ caretrack import --source-dir /path/to/源目录 --asset-id EQ-001 --asset-id EQ
 - 导入后查询、请求重放与编号延续保持；导入的未关闭工单可继续派工、关闭、
   取消或退回备件，目标已有工单行为不变。
 
+### 离线迁移包（导出与还原）
+
+```sh
+caretrack export  --asset-id EQ-001 --asset-id EQ-002 --package 迁移包.tar \
+  --data-dir /path/to/源目录
+caretrack restore --package 迁移包.tar --data-dir /path/to/新目录
+```
+
+- `export` 把所选资产连同全部工单、报修请求绑定、履历、保养计划、备件记录
+  与附件索引打包为**单个离线迁移包文件**（tar 归档，含清单、台账与资料成员），
+  并随包保存每条附件索引（**含已撤销**）指向的资料文件内容；全程不依赖外部
+  服务。`--asset-id` 可重复给出，重复编号按一项处理，至少一项。
+- 包内台账与数据文件同格式：保留业务内容、状态、各类编号、履历序号与原
+  计数器，位置起点、报修地点、保养方案段、撤销引用、履历顺序与时间精度
+  保持；数组乱序、序号间隔、时间不递增的有效旧库可直接打包。同路径的多条
+  索引在包内各自独立成成员。
+- 未知资产或源整库矛盾整次拒绝；任一所指资料当前不是可读普通文件则整次
+  拒绝，说明附件编号与原因，不把缺失资料当成完整迁移。源台账与原资料只读；
+  **已有包文件不得覆盖**，读取或写入失败不留下成品包。成功显示所选资产及
+  附件索引数量。
+- `restore` 把迁移包还原到**尚不存在**的目标数据目录（已有目录即拒绝）。
+  提交前完整核对包格式、版本、所选数据的业务关联、资料映射、实际成员与
+  校验值（SHA-256）：缺失、额外或重复成员、内容损坏、越界成员路径及链接
+  成员均拒绝，不按包内原绝对路径访问外部资料，也不写出目标目录；未知包
+  版本说明原因后拒绝。
+- 还原成功在目标内（`materials/` 子目录）建立独立资料副本，附件记录及对应
+  登记、撤销履历中的路径同步替换为副本的绝对路径，其余身份与业务含义保持，
+  不新增业务履历；所有资料与台账完整就绪后才公布成功，显示资产及附件索引
+  数量。失败不留下目标目录或部分资料，输入包与原数据字节保持，恢复条件后
+  可用原包重试。
+- 还原后移走源目录仍能读取有效附件，已撤销索引仍保持撤销；重载、查询、
+  请求重放及后续维修、保养、搬移和编号延续按原规则运行。`import`（目录到
+  目录、重编号、不复制资料）与 `export`/`restore`（单文件包、保留原编号、
+  随包携带资料）互不影响，可分别使用。
+
 ## 完整示例
 
 ```sh
@@ -483,6 +518,10 @@ caretrack detail   --data-dir $D --asset-id EQ-001
 caretrack reactivate --data-dir $D --asset-id EQ-001 --reason 调拨回库，恢复使用
 caretrack move     --data-dir $D --asset-id EQ-001 --location 三楼维修间 --reason 维修工位调整
 caretrack history  --data-dir $D --asset-id EQ-001
+# 离线迁移包：打包（附件资料须仍存在）并还原为全新数据目录
+caretrack export   --data-dir $D --asset-id EQ-001 --package /tmp/EQ-001.tar
+caretrack restore  --package /tmp/EQ-001.tar --data-dir /tmp/caretrack-restored
+caretrack ticket   --data-dir /tmp/caretrack-restored --ticket-id T0002
 ```
 
 ## 损坏与矛盾数据的处理

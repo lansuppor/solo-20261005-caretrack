@@ -281,19 +281,30 @@ func loadStore(dir string, allowMissing bool) (*store, error) {
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
 	}
+	d, err := decodeStoreData(raw)
+	if err != nil {
+		return nil, fmt.Errorf("数据文件 %s %w（原文件已保留，未做任何修改）", path, err)
+	}
+	return &store{dir: dir, data: d, now: time.Now}, nil
+}
+
+// decodeStoreData 解析台账字节并做整库一致性校验：空内容、无法解析或业务记录
+// 相互矛盾都返回指明问题类别的错误，调用方必须拒绝查询与写入。不做任何修复：
+// 不补字段、不重编号、不删除记录。无保养、备件或附件字段的有效旧库直接使用。
+func decodeStoreData(raw []byte) (*storeData, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, fmt.Errorf("数据文件 %s 已损坏：文件为空（原文件已保留，未做任何修改）", path)
+		return nil, errors.New("已损坏：文件为空")
 	}
 	var d storeData
 	if err := json.Unmarshal(raw, &d); err != nil {
-		return nil, fmt.Errorf("数据文件 %s 已损坏：%w（原文件已保留，未做任何修改）", path, err)
+		return nil, fmt.Errorf("已损坏：%w", err)
 	}
 	if d.EventsJSON != nil {
 		d.Events = make([]Event, len(d.EventsJSON))
 		for i, ej := range d.EventsJSON {
 			ev, err := ej.toEvent()
 			if err != nil {
-				return nil, fmt.Errorf("数据文件 %s 已损坏：%w（原文件已保留，未做任何修改）", path, err)
+				return nil, fmt.Errorf("已损坏：%w", err)
 			}
 			d.Events[i] = ev
 		}
@@ -319,9 +330,26 @@ func loadStore(dir string, allowMissing bool) (*store, error) {
 		d.NextAttachSeq = 1
 	}
 	if err := validateData(&d); err != nil {
-		return nil, fmt.Errorf("数据文件 %s 内容相互矛盾：%w（原文件已保留，未做任何修改）", path, err)
+		return nil, fmt.Errorf("内容相互矛盾：%w", err)
 	}
-	return &store{dir: dir, data: &d, now: time.Now}, nil
+	return &d, nil
+}
+
+// encodeStoreData 把业务数据编码为台账字节（缩进 JSON）：先由内存履历生成
+// 持久化的 EventsJSON，时间以 RFC3339Nano 保留小数秒精度。调用方负责校验
+// 与落盘。
+func encodeStoreData(d *storeData) ([]byte, error) {
+	d.EventsJSON = make([]eventJSON, len(d.Events))
+	for i, e := range d.Events {
+		d.EventsJSON[i] = e.toJSON()
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(d); err != nil {
+		return nil, fmt.Errorf("编码数据失败: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // parseTicketSeq 解析 T 加补零正整数序号形式的工单编号，返回序号。
@@ -1230,18 +1258,12 @@ func maintValidateError(err error) error {
 // 覆盖正式文件。写入前先校验待提交数据的一致性；校验或读写失败时原文件
 // 保持不变，不留下部分业务变化。
 func (s *store) save() error {
-	s.data.EventsJSON = make([]eventJSON, len(s.data.Events))
-	for i, e := range s.data.Events {
-		s.data.EventsJSON[i] = e.toJSON()
+	raw, err := encodeStoreData(s.data)
+	if err != nil {
+		return err
 	}
 	if err := validateData(s.data); err != nil {
 		return fmt.Errorf("待保存数据未通过一致性检查：%w（未写入任何数据）", err)
-	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(s.data); err != nil {
-		return fmt.Errorf("编码数据失败: %w", err)
 	}
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return fmt.Errorf("创建数据目录失败: %w", err)
@@ -1257,7 +1279,7 @@ func (s *store) save() error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if _, err := tmp.Write(buf.Bytes()); err != nil {
+	if _, err := tmp.Write(raw); err != nil {
 		abort(nil)
 		return fmt.Errorf("写入数据失败: %w", err)
 	}
