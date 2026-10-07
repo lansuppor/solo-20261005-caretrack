@@ -78,6 +78,31 @@ type restoreOutcome struct {
 	attachments int
 }
 
+// restoreTestHooks 汇集还原流程中仅供同包回归测试使用的最小接缝：各字段默认
+// 为 nil，还原始终执行真实的读写与文件系统操作，不提供任何用户可见的开关，
+// CLI 参数、包格式与输出均与此无关。接缝只在真实操作对应的位置被调用，
+// 测试借此确定性地令“这一次”真实操作失败（一般先制造真实的文件系统状态，
+// 再由真实操作本身返回错误），而不是在入口直接返回错误或以模拟还原代替。
+type restoreTestHooks struct {
+	// writeFault 在 writeAtomicFile 创建临时文件后、正式写入内容前按目标
+	// 路径调用；返回非 nil 时按真实写入失败处理（关闭并删除临时文件）。
+	// 接缝可先向 tmp 写入部分真实字节，模拟“写了一半后失败”。
+	writeFault func(path string, tmp *os.File, data []byte) error
+	// beforeMkdirAttach 在暂存目录内创建资料子目录的真实 MkdirAll 之前调用。
+	beforeMkdirAttach func(stage string)
+	// beforePreVerify 在发布前复核（真实的 loadStore 与副本校验值核对）之前调用。
+	beforePreVerify func(stage string)
+	// beforePublish 在暂存目录整体改名发布（真实 os.Rename）之前调用。
+	beforePublish func(stage, target string)
+	// beforePostVerify 在发布后复核（真实 openSourceStore 与资料可读性检查）
+	// 之前调用，此时目标目录已由真实改名发布生成。
+	beforePostVerify func(target string)
+}
+
+// restoreFault 为包内测试接缝的当前配置；生产路径恒为 nil，行为与无接缝一致。
+// 同包测试顺序执行，用例结束必须恢复为 nil，避免污染重试与其他测试。
+var restoreFault *restoreTestHooks
+
 // fileMemberName 生成第 i（从 1 起）个资料成员的包内名称。
 func fileMemberName(i int) string {
 	return fmt.Sprintf("%s/f%06d", migrateFilesDir, i)
@@ -543,6 +568,15 @@ func writeAtomicFile(path string, data []byte) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	// 测试接缝：在真实内容写入之前插入；返回错误时与真实写入失败走同一条
+	// 清理路径（关闭并删除临时文件）。默认无接缝时此处不产生任何行为差异。
+	if restoreFault != nil && restoreFault.writeFault != nil {
+		if ferr := restoreFault.writeFault(path, tmp, data); ferr != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+			return ferr
+		}
+	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
@@ -662,6 +696,9 @@ func restorePackage(packagePath, targetDir string) (*restoreOutcome, error) {
 		_ = os.RemoveAll(absTarget)
 		return nil, err
 	}
+	if restoreFault != nil && restoreFault.beforeMkdirAttach != nil {
+		restoreFault.beforeMkdirAttach(stage)
+	}
 	if err := os.MkdirAll(filepath.Join(stage, restoreAttachDir), 0o755); err != nil {
 		return abort(fmt.Errorf("创建资料目录失败: %w", err))
 	}
@@ -679,6 +716,9 @@ func restorePackage(packagePath, targetDir string) (*restoreOutcome, error) {
 	}
 	// 发布前在暂存目录内复核：台账可加载且业务自洽，每份资料为与包内一致的
 	// 普通文件（内容校验值相符）。
+	if restoreFault != nil && restoreFault.beforePreVerify != nil {
+		restoreFault.beforePreVerify(stage)
+	}
 	checkStore, err := loadStore(stage, false)
 	if err != nil {
 		return abort(fmt.Errorf("暂存台账复核失败: %w", err))
@@ -695,11 +735,17 @@ func restorePackage(packagePath, targetDir string) (*restoreOutcome, error) {
 		}
 	}
 	// 整体发布：暂存目录原子改名为目标目录。
+	if restoreFault != nil && restoreFault.beforePublish != nil {
+		restoreFault.beforePublish(stage, absTarget)
+	}
 	if err := os.Rename(stage, absTarget); err != nil {
 		return abort(fmt.Errorf("发布目标目录失败: %w", err))
 	}
 	// 发布后再复核一次：台账可加载、资料副本为可读普通文件。全部就绪后才
 	// 向调用方报告成功；失败则移除目标目录。
+	if restoreFault != nil && restoreFault.beforePostVerify != nil {
+		restoreFault.beforePostVerify(absTarget)
+	}
 	final, err := openSourceStore(absTarget)
 	if err != nil {
 		_ = os.RemoveAll(absTarget)
