@@ -5,20 +5,23 @@ import (
 	"sort"
 )
 
-// 周期保养计划与完成登记。
+// 周期保养计划、方案调整与完成登记。
 //
 // 日期一律为 0001 至 9999 年的公历日历日（YYYY-MM-DD），按日历日运算：
 // 不涉及时区与运行时刻，内部以“距 0001-01-01 的天数”做整数运算，避免
 // time.Time 的时区、跨度（time.Duration 约 292 年上限）与年份范围问题。
 //
-// 每个计划恰有一条建立履历（含初始计划：内容、首次到期日、间隔天数），
-// 每次完成登记追加一条完成履历（含周期到期日、实际完成日、结果），每次撤销
-// 误登记追加一条撤销履历（含目标完成履历序号、理由）。计划的下一到期日由
-// 履历链推出并保存在计划中，加载与保存时核对二者一致。
+// 每个计划恰有一条建立履历（含初始方案：内容、首次到期日、间隔天数），
+// 每次方案调整追加一条调整履历（含前后方案、原下一到期日、理由），每次完成
+// 登记追加一条完成履历（含周期到期日、实际完成日、结果），每次撤销误登记
+// 追加一条撤销履历（含目标完成履历序号、理由）。以该资产建立履历与各次调整
+// 履历的全库序号划分方案段：每段按当时方案推进，完成与撤销只作用于当前段。
+// 计划保存当前方案与由履历链推出的下一到期日，加载与保存时核对二者一致。
 // 保养不创建或终结工单、不消耗工单编号，不改变资产状态、请求绑定或停机统计。
 
 // Plan 为资产的周期保养计划；每项资产最多一个，不可覆盖。
-// NextDue 为由履历链推出的下一到期日，随每次完成登记推进。
+// Content/FirstDue/IntervalDays 为当前方案（随方案调整更换），
+// NextDue 为由履历链推出的下一到期日，随完成登记推进、随方案调整重设。
 type Plan struct {
 	AssetID      string `json:"asset_id"`
 	Content      string `json:"content"`
@@ -192,11 +195,83 @@ func (s *store) createPlan(assetID, content, firstDue string, intervalDays int) 
 	return p, nil
 }
 
-// completePlan 登记当前周期的保养完成：所填到期日必须等于当前下一到期日
-// （旧周期不能重复登记，也不能登记尚未到期的新周期），实际完成日不得早于
-// 周期到期日。成功时追加一条完成履历，并把下一到期日推进到首次到期日加整数倍
-// 间隔所得日期中严格晚于完成日的最早日期；延期跨过的周期不生成完成记录。
-// 若下一到期日超出 9999-12-31，整次拒绝。返回完成履历的全库序号。
+// adjustPlan 调整资产的周期保养方案：仅已有计划可调整（plan 只建立计划，不能
+// 覆盖；adjust 更换已有计划的内容、周期起点和间隔），维修中、停用时也允许。
+// 新首次到期日须严格晚于该资产所有未撤销完成的实际完成日；没有有效完成则无
+// 此限制。成功时计划采用新方案，下一到期日设为新首次到期日，并追加一条记录
+// 前后方案、原下一到期日、理由与时间的资产级调整履历；不补任何完成记录，
+// 原完成的内容、日期、时间及撤销状态保留。调整不改变资产状态、工单、请求
+// 绑定或停机统计。失败路径不修改任何业务数据。
+func (s *store) adjustPlan(assetID, content, firstDue string, intervalDays int, reason string) (*Plan, error) {
+	if s.findAsset(assetID) == nil {
+		return nil, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
+	}
+	p := s.findPlan(assetID)
+	if p == nil {
+		return nil, fmt.Errorf("%w: 资产 %s 没有保养计划，不能调整方案", errNotFound, assetID)
+	}
+	if content == "" {
+		return nil, fmt.Errorf("%w: 保养内容不能为空", errConflict)
+	}
+	if intervalDays < 1 {
+		return nil, fmt.Errorf("%w: 保养间隔天数须为正整数", errConflict)
+	}
+	newFirst, err := parseDate(firstDue)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 新首次到期日无效：%s", errConflict, err)
+	}
+	if reason == "" {
+		return nil, fmt.Errorf("%w: 调整理由不能为空", errConflict)
+	}
+	// 新首次日须严格晚于所有未撤销完成的实际完成日；没有有效完成则无此限制。
+	revoked := s.revokedDoneSeqs()
+	var maxDone int64
+	hasValid := false
+	for _, e := range s.data.Events {
+		if e.AssetID != assetID || e.Kind != eventPlanDone || revoked[e.Seq] {
+			continue
+		}
+		done, _ := parseDate(e.Done) // 整库一致性检查已保证完成日有效
+		if !hasValid || done > maxDone {
+			maxDone = done
+		}
+		hasValid = true
+	}
+	if hasValid && newFirst <= maxDone {
+		return nil, fmt.Errorf(
+			"%w: 新首次到期日 %s 须严格晚于资产 %s 未撤销完成的最晚实际完成日 %s",
+			errConflict, firstDue, assetID, formatDate(maxDone))
+	}
+	eventSeq, err := s.nextEventSeq()
+	if err != nil {
+		return nil, err
+	}
+	s.data.Events = append(s.data.Events, Event{
+		Seq:         eventSeq,
+		AssetID:     assetID,
+		Kind:        eventPlanAdjust,
+		Content:     content,
+		Due:         firstDue,
+		Interval:    intervalDays,
+		Reason:      reason,
+		OldContent:  p.Content,
+		OldDue:      p.FirstDue,
+		OldInterval: p.IntervalDays,
+		OldNextDue:  p.NextDue,
+		Time:        s.now(),
+	})
+	p.Content = content
+	p.FirstDue = firstDue
+	p.IntervalDays = intervalDays
+	p.NextDue = firstDue
+	return p, nil
+}
+
+// completePlan 登记当前方案段下一周期的保养完成：所填到期日必须等于当前下一
+// 到期日（旧周期不能重复登记，也不能登记尚未到期的新周期），实际完成日不得
+// 早于周期到期日。成功时追加一条完成履历，并把下一到期日推进到本段首次到期日
+// 加整数倍间隔所得日期中严格晚于完成日的最早日期；延期跨过的周期不生成完成
+// 记录。若下一到期日超出 9999-12-31，整次拒绝。返回完成履历的全库序号。
 // 失败路径不修改任何业务数据。
 func (s *store) completePlan(assetID, due, done, result string) (*Plan, string, int, error) {
 	if s.findAsset(assetID) == nil {
@@ -255,11 +330,12 @@ func (s *store) revokedDoneSeqs() map[int]bool {
 	return revoked
 }
 
-// revokeCompletion 撤销误登记的保养完成：目标须为该资产按序号最新的未撤销完成
-// （存在更晚有效完成时拒绝；撤销后可继续撤销此前最新有效完成）。成功时保留原
-// 完成的日期、结果与时间，追加一条含目标序号、理由与操作时间的撤销履历，并把
-// 下一到期日恢复为该完成的周期到期日（延期跨过的周期不补记录）。维修或其他
-// 资产事件不阻止撤销。失败路径不修改任何业务数据。
+// revokeCompletion 撤销误登记的保养完成：目标须为该资产当前方案段按序号最新的
+// 未撤销完成（存在更晚有效完成时拒绝；撤销后可继续撤销本段此前最新有效完成；
+// 方案段由该资产建立履历与各次调整履历的全库序号划分，旧段完成不能再撤销）。
+// 成功时保留原完成的日期、结果与时间，追加一条含目标序号、理由与操作时间的
+// 撤销履历，并把下一到期日恢复为该完成的周期到期日（延期跨过的周期不补记录）。
+// 维修或其他资产事件不阻止撤销。失败路径不修改任何业务数据。
 func (s *store) revokeCompletion(assetID string, targetSeq int, reason string) (*Plan, *Event, error) {
 	if s.findAsset(assetID) == nil {
 		return nil, nil, fmt.Errorf("%w: 未知资产编号 %q", errNotFound, assetID)
@@ -288,15 +364,27 @@ func (s *store) revokeCompletion(assetID string, targetSeq int, reason string) (
 	if revoked[targetSeq] {
 		return nil, nil, fmt.Errorf("%w: 完成履历序号 %d 已撤销，不能重复撤销", errConflict, targetSeq)
 	}
+	// 当前方案段起点：该资产建立履历或最近一次调整履历的序号。
+	segStart := 0
+	for _, e := range s.data.Events {
+		if e.AssetID == assetID && (e.Kind == eventPlanCreate || e.Kind == eventPlanAdjust) && e.Seq > segStart {
+			segStart = e.Seq
+		}
+	}
+	if target.Seq <= segStart {
+		return nil, nil, fmt.Errorf(
+			"%w: 完成履历序号 %d 属于资产 %s 的旧方案段，方案调整后旧段完成不能再撤销",
+			errConflict, targetSeq, assetID)
+	}
 	latest := 0
 	for _, e := range s.data.Events {
-		if e.AssetID == assetID && e.Kind == eventPlanDone && !revoked[e.Seq] && e.Seq > latest {
+		if e.AssetID == assetID && e.Kind == eventPlanDone && e.Seq > segStart && !revoked[e.Seq] && e.Seq > latest {
 			latest = e.Seq
 		}
 	}
 	if latest != targetSeq {
 		return nil, nil, fmt.Errorf(
-			"%w: 完成履历序号 %d 不是资产 %s 最新的有效完成（当前为序号 %d），存在更晚有效完成时不能撤销",
+			"%w: 完成履历序号 %d 不是资产 %s 当前方案段最新的有效完成（当前为序号 %d），存在更晚有效完成时不能撤销",
 			errConflict, targetSeq, assetID, latest)
 	}
 	eventSeq, err := s.nextEventSeq()
