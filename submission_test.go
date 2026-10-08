@@ -652,10 +652,17 @@ func TestReplayPendingSubmission(t *testing.T) {
 		snap.openTicket.submitSeq != seq2 || snap.openTicket.submitResult != "第二次结果" {
 		t.Fatalf("截止 4 回看异常: %+v", snap.openTicket)
 	}
-	// 截止 5：验收通过已发生但关闭履历未到，仍待验收（后续关闭不提前生效）。
+	// 截止 5：验收通过已发生但关闭履历未到，工单显示“验收通过待关闭”：仍未
+	// 终结、资产仍维修中，但当前待验收提交为无；不能提前采用关闭后的最终状态。
 	snap = s.replayAsset("EQ-1", 5)
-	if snap.openTicket == nil || snap.openTicket.status != ticketPending {
+	if snap.openTicket == nil || snap.openTicket.status != derivedApproved {
 		t.Fatalf("截止 5 回看异常: %+v", snap.openTicket)
+	}
+	if snap.openTicket.submitSeq != 0 || snap.openTicket.submitResult != "" {
+		t.Fatalf("验收通过待关闭时当前待验收提交应为无: %+v", snap.openTicket)
+	}
+	if snap.status != statusRepairing {
+		t.Fatalf("截止 5 资产应仍为维修中，得到 %q", snap.status)
 	}
 	// 截止 6：工单已关闭，资产可用。
 	snap = s.replayAsset("EQ-1", 6)

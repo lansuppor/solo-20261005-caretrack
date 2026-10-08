@@ -42,9 +42,11 @@ type replaySnapshot struct {
 }
 
 // replayTicket 为截止处仍未终结工单的回看信息；报修地点为报修履历序号当时
-// 的资产位置，维修中搬移不改变它。status 为截止处的工单状态（未关闭或待验收）；
-// 待验收时 submitSeq/submitResult 为当时待验收提交的履历序号与维修结果，
-// 截止之后的验收（通过或退回）不提前生效。
+// 的资产位置，维修中搬移不改变它。status 为截止处的工单状态：未关闭、待验收
+// 或验收通过待关闭中间态；后两者都表示工单仍占用资产。待验收时
+// submitSeq/submitResult 为当时待验收提交的履历序号与维修结果；验收通过待关闭
+// 中间态（验收履历已纳入、紧随的关闭履历尚未纳入）时当前待验收提交为无，
+// 截止之后的验收（通过或退回）与关闭不提前生效。
 type replayTicket struct {
 	id             string
 	assignee       string
@@ -87,46 +89,30 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 	sort.SliceStable(events, func(i, j int) bool { return events[i].Seq < events[j].Seq })
 
 	var openID string
-	openStatus := ""
 	assignee := ""
-	submitSeq := 0
-	submitResult := ""
 	deactivated := false
 	core := newMaintCore()
+	// 提交验收链状态（未关闭/待验收/验收通过待关闭中间态、当前待验收提交身份）
+	// 由共享规则核心按截止前履历重放，与日常操作、加载与保存校验共用同一套
+	// 判定，不直接采用保存的最终状态。
+	chain := newRepairCore()
 	for _, e := range events {
+		// 提交、验收、直接关闭、取消与报修的接续全部由规则核心判定；其余
+		// 履历在核心中忽略。
+		_ = chain.apply(e)
 		switch e.Kind {
 		case eventReport:
 			// 整库一致性已保证同一资产前一张工单终结后才会产生新报修。
 			openID = e.TicketID
-			openStatus = ticketOpen
 			assignee = ""
-			submitSeq = 0
-			submitResult = ""
 		case eventAssign:
 			if e.TicketID == openID {
 				assignee = e.To
 			}
-		case eventSubmit:
-			if e.TicketID == openID {
-				openStatus = ticketPending
-				submitSeq = e.Seq
-				submitResult = e.Content
-			}
-		case eventAccept:
-			// 退回恢复未关闭；通过后紧随的关闭履历会终结工单，截止落在两者
-			// 之间时保持待验收（后续关闭不提前生效）。
-			if e.TicketID == openID && e.Decision == decisionReject {
-				openStatus = ticketOpen
-				submitSeq = 0
-				submitResult = ""
-			}
 		case eventClose, eventCancel:
 			if e.TicketID == openID {
 				openID = ""
-				openStatus = ""
 				assignee = ""
-				submitSeq = 0
-				submitResult = ""
 			}
 		case eventRelocate:
 			snap.location = e.To
@@ -149,6 +135,13 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 		snap.status = statusAvailable
 	}
 	if openID != "" {
+		openStatus := chain.state(openID)
+		submitSeq, submitResult := 0, ""
+		// 仅待验收状态有当前待验收提交；验收通过待关闭中间态（验收已纳入、
+		// 关闭尚未纳入）当前待验收提交为无，不能把刚通过的提交再列为待验收。
+		if seq, result, ok := chain.pending(openID); ok && openStatus == ticketPending {
+			submitSeq, submitResult = seq, result
+		}
 		snap.openTicket = &replayTicket{
 			id:             openID,
 			assignee:       assignee,
