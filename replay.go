@@ -42,9 +42,10 @@ type replaySnapshot struct {
 }
 
 // replayTicket 为截止处仍未终结工单的回看信息；报修地点为报修履历序号当时
-// 的资产位置，维修中搬移不改变它。status 为截止处的工单状态（未关闭或待验收）；
-// 待验收时 submitSeq/submitResult 为当时待验收提交的履历序号与维修结果，
-// 截止之后的验收（通过或退回）不提前生效。
+// 的资产位置，维修中搬移不改变它。status 为截止处的工单状态（未关闭、待验收
+// 或验收通过待关闭）；待验收时 submitSeq/submitResult 为当时待验收提交的履历
+// 序号与维修结果；验收通过待关闭中间态工单仍未终结，但当前待验收提交为无，
+// 截止之后的关闭不提前生效。退回或取消后，已处理提交不会被列为待验收。
 type replayTicket struct {
 	id             string
 	assignee       string
@@ -86,48 +87,25 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 	}
 	sort.SliceStable(events, func(i, j int) bool { return events[i].Seq < events[j].Seq })
 
-	var openID string
-	openStatus := ""
-	assignee := ""
-	submitSeq := 0
-	submitResult := ""
+	// 维修链（提交、验收、直接关闭、取消的转换、提交身份与目标引用）全部由共用
+	// 规则核心按截止前缀重放：截止处的工单状态与当前待验收提交只取自核心，绝不
+	// 采用记录保存的最终值，截止之后的验收或关闭不会提前生效。验收通过已纳入、
+	// 关闭尚未纳入时核心给出“验收通过待关闭”：工单仍未终结、资产仍维修中，
+	// 但当前待验收提交为无。
 	deactivated := false
 	core := newMaintCore()
+	repair := newRepairCore()
+	assignee := map[string]string{}
 	for _, e := range events {
+		if err := repair.apply(e); err != nil {
+			// openStore 已先做整库一致性检查，截止前缀是合法全库的前缀，重放
+			// 必然成功；失败说明数据在检查后被改动。
+			break
+		}
 		switch e.Kind {
-		case eventReport:
-			// 整库一致性已保证同一资产前一张工单终结后才会产生新报修。
-			openID = e.TicketID
-			openStatus = ticketOpen
-			assignee = ""
-			submitSeq = 0
-			submitResult = ""
 		case eventAssign:
-			if e.TicketID == openID {
-				assignee = e.To
-			}
-		case eventSubmit:
-			if e.TicketID == openID {
-				openStatus = ticketPending
-				submitSeq = e.Seq
-				submitResult = e.Content
-			}
-		case eventAccept:
-			// 退回恢复未关闭；通过后紧随的关闭履历会终结工单，截止落在两者
-			// 之间时保持待验收（后续关闭不提前生效）。
-			if e.TicketID == openID && e.Decision == decisionReject {
-				openStatus = ticketOpen
-				submitSeq = 0
-				submitResult = ""
-			}
-		case eventClose, eventCancel:
-			if e.TicketID == openID {
-				openID = ""
-				openStatus = ""
-				assignee = ""
-				submitSeq = 0
-				submitResult = ""
-			}
+			// 派工只作用于当时未关闭工单；每张工单记录其最后负责人。
+			assignee[e.TicketID] = e.To
 		case eventRelocate:
 			snap.location = e.To
 		case eventDeactivate:
@@ -140,6 +118,15 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 		_ = core.apply(e)
 	}
 
+	// 截止处该资产至多一张未终结工单（未关闭、待验收或验收通过待关闭），
+	// 由整库一致性检查保证。
+	var openID, openStatus string
+	for tid, st := range repair.tickets {
+		switch st.status {
+		case ticketOpen, ticketPending, derivedApproved:
+			openID, openStatus = tid, st.status
+		}
+	}
 	switch {
 	case deactivated:
 		snap.status = statusDeactivated
@@ -149,14 +136,19 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 		snap.status = statusAvailable
 	}
 	if openID != "" {
-		snap.openTicket = &replayTicket{
+		rt := &replayTicket{
 			id:             openID,
-			assignee:       assignee,
+			assignee:       assignee[openID],
 			reportLocation: s.locationAtSeq(assetID, s.ticketReportSeq(assetID, openID, cutoff)),
 			status:         openStatus,
-			submitSeq:      submitSeq,
-			submitResult:   submitResult,
 		}
+		// 当前待验收提交只取自核心：待验收时有序号与结果；未关闭（含退回后）
+		// 与验收通过待关闭中间态均为无，已处理提交不会被列为待验收。
+		if seq, result, ok := repair.pending(openID); ok {
+			rt.submitSeq = seq
+			rt.submitResult = result
+		}
+		snap.openTicket = rt
 	}
 	if content, firstDue, interval, nextDue, created := core.derived(assetID); created {
 		snap.plan = &replayPlan{
@@ -196,6 +188,10 @@ func printReplay(w io.Writer, snap *replaySnapshot) {
 		if snap.openTicket.status == ticketPending {
 			fmt.Fprintf(w, "待验收提交序号: %d\n", snap.openTicket.submitSeq)
 			fmt.Fprintf(w, "待验收提交结果: %s\n", snap.openTicket.submitResult)
+		} else {
+			// 未关闭（含退回后）与验收通过待关闭中间态都没有当前待验收提交；
+			// 中间态工单仍未终结、资产仍维修中，关闭履历未纳入前不提前释放。
+			fmt.Fprintln(w, "待验收提交: 无")
 		}
 		fmt.Fprintf(w, "工单负责人: %s\n", assigneeDisplay(snap.openTicket.assignee))
 		fmt.Fprintf(w, "报修地点: %s\n", snap.openTicket.reportLocation)

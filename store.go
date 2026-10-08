@@ -915,13 +915,11 @@ func validateData(d *storeData) error {
 	derivedDeactivated := map[string]bool{}
 	derivedAssignee := map[string]string{}
 	derivedNote := map[string]string{}
-	// 提交验收链：submittedEver 记录工单是否曾提交（首次提交后只能验收通过或
-	// 取消终结）；pendingSeq/pendingResult 为当前待验收提交的履历序号与维修
-	// 结果；approvedResult 为验收通过待关闭时该次提交的维修结果。
-	submittedEver := map[string]bool{}
-	pendingSeq := map[string]int{}
-	pendingResult := map[string]string{}
-	approvedResult := map[string]string{}
+	// 提交验收链（提交、验收、直接关闭、取消的转换、提交身份与目标引用）全部
+	// 由维修链规则核心（repaircore.go）按全库序号重放核对，与日常操作、查询及
+	// replay 回看共用同一套规则；本循环只同步核心推出的工单状态，供派工、备件
+	// 与资产占用等其余接续判定使用。
+	repair := newRepairCore()
 	withdrawSeq := map[string]int{}
 	derivedReturned := map[string]int{}
 	attachRegSeq := map[string]int{}
@@ -929,9 +927,6 @@ func validateData(d *storeData) error {
 	for _, e := range sorted {
 		switch e.Kind {
 		case eventReport:
-			if derivedTicket[e.TicketID] != "" {
-				return fmt.Errorf("履历矛盾：工单 %s 被重复报修", e.TicketID)
-			}
 			if prev := derivedOpen[e.AssetID]; prev != "" {
 				return fmt.Errorf("履历矛盾：资产 %s 的上一张工单 %s 尚未结束就产生了工单 %s 的报修",
 					e.AssetID, prev, e.TicketID)
@@ -943,7 +938,10 @@ func validateData(d *storeData) error {
 			// 报修地点取该报修履历序号当时的资产位置：不能用当前地点、履历
 			// 时间或数组位置代替。
 			ticketReportLocation[e.TicketID] = derivedLocation[e.AssetID]
-			derivedTicket[e.TicketID] = ticketOpen
+			if err := repair.apply(e); err != nil {
+				return repairValidateError(err)
+			}
+			derivedTicket[e.TicketID] = repair.status(e.TicketID)
 			derivedOpen[e.AssetID] = e.TicketID
 		case eventRelocate:
 			// 原位置须接续当时位置；新位置非空且与原位置不同（非空与不同已在
@@ -993,64 +991,38 @@ func validateData(d *storeData) error {
 			derivedAssignee[e.TicketID] = e.To
 			derivedNote[e.TicketID] = e.Content
 		case eventClose:
-			switch derivedTicket[e.TicketID] {
-			case ticketOpen:
-				// 从未提交的工单可按原 close 直接关闭；首次提交后只能验收
-				// 通过或取消终结，退回后也不能绕过验收直接关闭。
-				if submittedEver[e.TicketID] {
-					return fmt.Errorf("履历矛盾：工单 %s 首次提交后只能验收通过或取消终结，却出现直接关闭履历（序号 %d）",
-						e.TicketID, e.Seq)
-				}
-			case derivedApproved:
-				// 验收通过后的关闭履历：维修结果取该次提交内容。
-				if e.Content != approvedResult[e.TicketID] {
-					return fmt.Errorf("履历矛盾：工单 %s 的关闭履历（序号 %d）内容与验收通过的提交维修结果不一致",
-						e.TicketID, e.Seq)
-				}
-			default:
-				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现关闭履历", e.TicketID)
+			// 关闭的全部接续判定由维修链规则核心完成：未关闭且从未提交可直接
+			// 关闭；验收通过待关闭中间态只接受同单且内容与该次提交结果匹配的
+			// 关闭；待验收、已终结或首次提交后的直接关闭均矛盾。
+			if err := repair.apply(e); err != nil {
+				return repairValidateError(err)
 			}
-			derivedTicket[e.TicketID] = ticketClosed
+			derivedTicket[e.TicketID] = repair.status(e.TicketID)
 			delete(derivedOpen, e.AssetID)
 		case eventCancel:
-			// 未关闭与待验收工单均可取消；待验收取消保留提交且不填写维修结果。
-			if derivedTicket[e.TicketID] != ticketOpen && derivedTicket[e.TicketID] != ticketPending {
-				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭或待验收状态时出现取消履历", e.TicketID)
+			// 取消的全部接续判定由维修链规则核心完成：未关闭与待验收可取消，
+			// 已关闭、已取消或验收通过待关闭中间态矛盾；取消清除当前待验收
+			// 提交但保留全部提交历史。
+			if err := repair.apply(e); err != nil {
+				return repairValidateError(err)
 			}
-			derivedTicket[e.TicketID] = ticketCancelled
+			derivedTicket[e.TicketID] = repair.status(e.TicketID)
 			delete(derivedOpen, e.AssetID)
 		case eventSubmit:
-			// 仅未关闭工单可提交；成功后工单转为待验收，提交履历的全库序号
-			// 即该次提交的身份。
-			if derivedTicket[e.TicketID] != ticketOpen {
-				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现提交履历（序号 %d）",
-					e.TicketID, e.Seq)
+			// 提交的接续判定（仅未关闭、非空结果、转待验收、序号即身份）由
+			// 维修链规则核心完成。
+			if err := repair.apply(e); err != nil {
+				return repairValidateError(err)
 			}
-			derivedTicket[e.TicketID] = ticketPending
-			pendingSeq[e.TicketID] = e.Seq
-			pendingResult[e.TicketID] = e.Content
-			submittedEver[e.TicketID] = true
+			derivedTicket[e.TicketID] = repair.status(e.TicketID)
 		case eventAccept:
-			// 仅当前待验收提交可被验收：目标序号须等于当前待验收提交的履历
-			// 序号；未知序号、非提交序号、跨单、已处理或非当前提交均不接续。
-			if derivedTicket[e.TicketID] != ticketPending {
-				return fmt.Errorf("履历矛盾：工单 %s 在未处于待验收状态时出现验收履历（序号 %d）",
-					e.TicketID, e.Seq)
+			// 验收的接续判定（仅待验收、目标恰为当前待验收提交、通过/退回
+			// 转换、待关闭中间态）由维修链规则核心完成；未知序号、非提交序号、
+			// 跨单、已处理或非当前提交均由核心分类拒绝。
+			if err := repair.apply(e); err != nil {
+				return repairValidateError(err)
 			}
-			if e.TargetSeq != pendingSeq[e.TicketID] {
-				return fmt.Errorf("履历矛盾：验收履历（序号 %d）的目标提交序号 %d 与工单 %s 当前待验收提交（序号 %d）不符",
-					e.Seq, e.TargetSeq, e.TicketID, pendingSeq[e.TicketID])
-			}
-			if e.Decision == decisionApprove {
-				// 通过：进入待关闭中间态，随后由关闭履历终结（同一原子保存）。
-				derivedTicket[e.TicketID] = derivedApproved
-				approvedResult[e.TicketID] = pendingResult[e.TicketID]
-			} else {
-				// 退回：恢复未关闭，资产仍为维修中，可再次提交并产生新序号。
-				derivedTicket[e.TicketID] = ticketOpen
-			}
-			delete(pendingSeq, e.TicketID)
-			delete(pendingResult, e.TicketID)
+			derivedTicket[e.TicketID] = repair.status(e.TicketID)
 		case eventPartWithdraw:
 			// 领用须在报修之后、终结之前；履历与领用记录的业务字段必须一致。
 			if derivedTicket[e.TicketID] != ticketOpen {
@@ -1319,6 +1291,70 @@ func maintValidateError(err error) error {
 	return err
 }
 
+// repairValidateError 把维修链规则核心返回的规则冲突包装为台账校验场景的错误
+// （指明“履历矛盾”类别）；调用方拒绝查询与写入并保留原文件，不自动修复。
+func repairValidateError(err error) error {
+	var re *repairRuleError
+	if !errors.As(err, &re) {
+		return err
+	}
+	switch re.code {
+	case ruleRepairDuplicateReport:
+		return fmt.Errorf("履历矛盾：工单 %s 被重复报修", re.ticketID)
+	case ruleSubmitNotOpen:
+		return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现提交履历（序号 %d）",
+			re.ticketID, re.seq)
+	case ruleSubmitEmptyResult:
+		return fmt.Errorf("履历矛盾：提交履历（序号 %d）的维修结果为空", re.seq)
+	case ruleCloseNoReport:
+		return fmt.Errorf("履历矛盾：工单 %s 在报修之前出现关闭履历（序号 %d）", re.ticketID, re.seq)
+	case ruleCloseAlreadyClosed:
+		return fmt.Errorf("履历矛盾：工单 %s 已关闭后又出现关闭履历（序号 %d）", re.ticketID, re.seq)
+	case ruleCloseAlreadyCancelled:
+		return fmt.Errorf("履历矛盾：工单 %s 已取消后出现关闭履历（序号 %d）", re.ticketID, re.seq)
+	case ruleClosePending:
+		return fmt.Errorf("履历矛盾：工单 %s 处于待验收时出现直接关闭履历（序号 %d），须先验收或取消",
+			re.ticketID, re.seq)
+	case ruleCloseAfterSubmit:
+		return fmt.Errorf("履历矛盾：工单 %s 首次提交后只能验收通过或取消终结，却出现直接关闭履历（序号 %d）",
+			re.ticketID, re.seq)
+	case ruleCloseApprovedMismatch:
+		return fmt.Errorf("履历矛盾：工单 %s 的关闭履历（序号 %d）内容 %q 与验收通过的提交维修结果 %q 不一致",
+			re.ticketID, re.seq, re.contentA, re.contentB)
+	case ruleCloseEmptyResult:
+		return fmt.Errorf("履历矛盾：关闭履历（序号 %d）的维修结果为空", re.seq)
+	case ruleCancelNoReport:
+		return fmt.Errorf("履历矛盾：工单 %s 在报修之前出现取消履历（序号 %d）", re.ticketID, re.seq)
+	case ruleCancelAlreadyClosed:
+		return fmt.Errorf("履历矛盾：工单 %s 已关闭后出现取消履历（序号 %d）", re.ticketID, re.seq)
+	case ruleCancelAlreadyCancelled:
+		return fmt.Errorf("履历矛盾：工单 %s 已取消后又出现取消履历（序号 %d）", re.ticketID, re.seq)
+	case ruleCancelApprovedPending:
+		return fmt.Errorf("履历矛盾：工单 %s 在验收通过待关闭时出现取消履历（序号 %d），验收与关闭须同次保存",
+			re.ticketID, re.seq)
+	case ruleAcceptNotPending:
+		return fmt.Errorf("履历矛盾：工单 %s 在未处于待验收状态时出现验收履历（序号 %d）",
+			re.ticketID, re.seq)
+	case ruleAcceptEmptyComment:
+		return fmt.Errorf("履历矛盾：验收履历（序号 %d）的验收意见为空", re.seq)
+	case ruleAcceptBadDecision:
+		return fmt.Errorf("履历矛盾：验收履历（序号 %d）的决定无效", re.seq)
+	case ruleAcceptTargetUnknown:
+		return fmt.Errorf("履历矛盾：验收履历（序号 %d）的目标提交序号 %d 不存在",
+			re.seq, re.target)
+	case ruleAcceptTargetNotSubmit:
+		return fmt.Errorf("履历矛盾：验收履历（序号 %d）的目标序号 %d 不是提交履历（实际为%s履历）",
+			re.seq, re.target, re.kind)
+	case ruleAcceptTargetCrossTicket:
+		return fmt.Errorf("履历矛盾：验收履历（序号 %d）的目标提交序号 %d 属于工单 %s，不能用于工单 %s",
+			re.seq, re.target, re.owner, re.ticketID)
+	case ruleAcceptTargetProcessed:
+		return fmt.Errorf("履历矛盾：验收履历（序号 %d）的目标提交序号 %d 已处理或不是工单 %s 当前待验收提交",
+			re.seq, re.target, re.ticketID)
+	}
+	return err
+}
+
 // save 将全部业务数据一次性原子写入：先写同目录临时文件，fsync 后 rename
 // 覆盖正式文件。写入前先校验待提交数据的一致性；校验或读写失败时原文件
 // 保持不变，不留下部分业务变化。
@@ -1520,24 +1556,25 @@ func (s *store) report(assetID, description, requestID string) (*Ticket, bool, e
 }
 
 // closeTicket 关闭未关闭工单并把资产恢复为可用。仅从未提交的工单可直接关闭；
-// 首次提交后只能验收通过或取消终结（退回后也不能绕过验收直接关闭）。
-// 失败路径不修改任何业务数据。
+// 首次提交后只能验收通过或取消终结（退回后也不能绕过验收直接关闭）；验收通过
+// 的关闭履历只由 acceptSubmission 在同一保存中追加。能否关闭的判定（未终结、
+// 未提交过、非空结果）由维修链规则核心对候选关闭履历完成。失败路径不修改任何
+// 业务数据。
 func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 	t := s.findTicket(ticketID)
 	if t == nil {
 		return nil, nil, fmt.Errorf("%w: 未知工单编号 %q", errNotFound, ticketID)
 	}
-	if t.Status == ticketCancelled {
-		return nil, nil, fmt.Errorf("%w: 工单 %s 已取消，不能关闭", errConflict, ticketID)
+	if result == "" {
+		return nil, nil, fmt.Errorf("%w: 维修结果不能为空", errConflict)
 	}
-	if t.Status == ticketPending {
-		return nil, nil, fmt.Errorf("%w: 工单 %s 处于待验收，须验收通过或取消终结，不能直接关闭", errConflict, ticketID)
+	core, err := s.repairCore()
+	if err != nil {
+		return nil, nil, err
 	}
-	if t.Status != ticketOpen {
-		return nil, nil, fmt.Errorf("%w: 工单 %s 已关闭，不能重复关闭", errConflict, ticketID)
-	}
-	if s.hasSubmission(ticketID) {
-		return nil, nil, fmt.Errorf("%w: 工单 %s 已提交过维修，不能直接关闭，须重新提交并验收通过或取消", errConflict, ticketID)
+	// 候选履历不带序号：核心只按当时工单状态与内容判定；判定通过后才分配序号。
+	if err := core.apply(Event{TicketID: ticketID, Kind: eventClose, Content: result}); err != nil {
+		return nil, nil, repairOpError(err)
 	}
 	asset := s.findAsset(t.AssetID)
 	if asset == nil {
@@ -1557,17 +1594,23 @@ func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 
 // cancelTicket 取消未关闭或待验收工单并把资产恢复为可用。取消是终态，但不代表
 // 维修完成：不填写维修结果，不删除工单、履历（含全部提交与验收履历）或请求
-// 绑定，工单编号不回退也不复用。失败路径不修改任何业务数据。
+// 绑定，工单编号不回退也不复用。能否取消（未关闭或待验收；已关闭、已取消或
+// 验收通过待关闭中间态拒绝）由维修链规则核心对候选取消履历完成，取消同时清除
+// 当前待验收提交。失败路径不修改任何业务数据。
 func (s *store) cancelTicket(ticketID, reason string) (*Ticket, *Asset, error) {
 	t := s.findTicket(ticketID)
 	if t == nil {
 		return nil, nil, fmt.Errorf("%w: 未知工单编号 %q", errNotFound, ticketID)
 	}
-	if t.Status == ticketCancelled {
-		return nil, nil, fmt.Errorf("%w: 工单 %s 已取消，不能再次取消", errConflict, ticketID)
+	if reason == "" {
+		return nil, nil, fmt.Errorf("%w: 取消理由不能为空", errConflict)
 	}
-	if t.Status == ticketClosed {
-		return nil, nil, fmt.Errorf("%w: 工单 %s 已关闭，不能取消", errConflict, ticketID)
+	core, err := s.repairCore()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := core.apply(Event{TicketID: ticketID, Kind: eventCancel, Content: reason}); err != nil {
+		return nil, nil, repairOpError(err)
 	}
 	asset := s.findAsset(t.AssetID)
 	if asset == nil {
