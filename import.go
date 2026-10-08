@@ -12,7 +12,7 @@ import (
 )
 
 // 资产批量导入：把源数据目录中所选资产连同其全部工单、报修请求绑定、
-// 报修/派工/关闭/取消履历、停用/恢复使用履历（含当前停用或可用状态）、
+// 报修/派工/提交/验收/关闭/取消履历、停用/恢复使用履历（含当前停用或可用状态）、
 // 位置起点（最早一条位置变更履历的原位置；没有位置履历则为资产保存位置）、
 // 当前位置与全部位置变更履历、备件领用记录、附件索引（含登记/撤销履历）
 // 与保养计划（含保养建立/完成/撤销/调整履历）复制到目标数据目录。
@@ -398,9 +398,10 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		ne.TicketID = remap[e.TicketID]
 		ne.WithdrawalID = partIDs[e.WithdrawalID]
 		ne.AttachmentID = attachIDs[e.AttachmentID]
-		if e.Kind == eventPlanRevoke {
-			// 撤销履历的目标完成序号随履历重编号同步替换：目标在源序号顺序中
-			// 先于撤销出现（源台账已通过一致性检查），此处必然已有映射。
+		if e.Kind == eventPlanRevoke || e.Kind == eventReview {
+			// 撤销履历的目标完成序号、验收履历的目标提交序号随履历重编号同步
+			// 替换：目标在源序号顺序中先于撤销/验收出现（源台账已通过一致性
+			// 检查），此处必然已有映射。导入后可用目标序号继续撤销或验收。
 			ne.TargetSeq = seqRemap[e.TargetSeq]
 		}
 		seqRemap[e.Seq] = seq
