@@ -116,6 +116,9 @@ func (s *store) withdrawPart(ticketID, partID string, quantity int, note string)
 	if t.Status == ticketCancelled {
 		return nil, fmt.Errorf("%w: 工单 %s 已取消，不能领用备件", errConflict, ticketID)
 	}
+	if t.Status == ticketPending {
+		return nil, fmt.Errorf("%w: 工单 %s 处于待验收，不能领用备件", errConflict, ticketID)
+	}
 	if partID == "" {
 		return nil, fmt.Errorf("%w: 备件编号不能为空", errConflict)
 	}
@@ -166,6 +169,9 @@ func (s *store) returnPart(withdrawalID string, quantity int, reason string) (*P
 	}
 	if t.Status == ticketCancelled {
 		return nil, nil, fmt.Errorf("%w: 工单 %s 已取消，不能退回备件", errConflict, t.ID)
+	}
+	if t.Status == ticketPending {
+		return nil, nil, fmt.Errorf("%w: 工单 %s 处于待验收，不能退回备件", errConflict, t.ID)
 	}
 	if reason == "" {
 		return nil, nil, fmt.Errorf("%w: 退回理由不能为空", errConflict)

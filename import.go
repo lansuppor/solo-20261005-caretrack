@@ -30,7 +30,9 @@ import (
 //     导入失败。
 //   - 履历按源履历序号排列，在目标已有最大履历序号之后依次分配新序号，保留原操作
 //     顺序（不按时间重排）；履历时间保留原瞬间与小数秒精度。导入本身不追加报修
-//     或其他业务事件。
+//     或其他业务事件。提交与验收履历随工单一并复制，验收履历中的目标提交序号随
+//     履历重编号同步替换，并输出提交履历序号的原、新映射；导入后可用目标序号
+//     继续验收当前待验收提交。
 //   - 保养计划随资产原样复制（内容、首次到期日、间隔与下一到期日不变），保养履历
 //     （含撤销与调整履历）随资产履历一并复制，完成与撤销链自然接续，方案段边界、
 //     顺序与时间精度保持，撤销履历中的目标
@@ -88,6 +90,7 @@ type importOutcome struct {
 	parts       []partRemap
 	attachments []attachRemap
 	completions []completionRemap
+	submissions []completionRemap
 	plans       int
 }
 
@@ -144,6 +147,12 @@ func cmdImport(args []string, w io.Writer) error {
 	if len(outcome.completions) > 0 {
 		fmt.Fprintln(w, "完成履历序号映射（原序号 -> 新序号）:")
 		for _, m := range outcome.completions {
+			fmt.Fprintf(w, "%d -> %d\n", m.OldSeq, m.NewSeq)
+		}
+	}
+	if len(outcome.submissions) > 0 {
+		fmt.Fprintln(w, "提交履历序号映射（原序号 -> 新序号）:")
+		for _, m := range outcome.submissions {
 			fmt.Fprintf(w, "%d -> %d\n", m.OldSeq, m.NewSeq)
 		}
 	}
@@ -398,14 +407,18 @@ func (s *store) mergeImport(src *store, assetIDs []string) (*importOutcome, erro
 		ne.TicketID = remap[e.TicketID]
 		ne.WithdrawalID = partIDs[e.WithdrawalID]
 		ne.AttachmentID = attachIDs[e.AttachmentID]
-		if e.Kind == eventPlanRevoke {
-			// 撤销履历的目标完成序号随履历重编号同步替换：目标在源序号顺序中
-			// 先于撤销出现（源台账已通过一致性检查），此处必然已有映射。
+		if e.Kind == eventPlanRevoke || e.Kind == eventAccept {
+			// 撤销履历的目标完成序号、验收履历的目标提交序号随履历重编号同步
+			// 替换：目标在源序号顺序中先于撤销/验收出现（源台账已通过一致性
+			// 检查），此处必然已有映射。
 			ne.TargetSeq = seqRemap[e.TargetSeq]
 		}
 		seqRemap[e.Seq] = seq
 		if e.Kind == eventPlanDone {
 			outcome.completions = append(outcome.completions, completionRemap{OldSeq: e.Seq, NewSeq: seq})
+		}
+		if e.Kind == eventSubmit {
+			outcome.submissions = append(outcome.submissions, completionRemap{OldSeq: e.Seq, NewSeq: seq})
 		}
 		s.data.Events = append(s.data.Events, ne)
 	}

@@ -20,6 +20,7 @@ const (
 	statusRepairing   = "维修中"
 	statusDeactivated = "停用"
 	ticketOpen        = "未关闭"
+	ticketPending     = "待验收"
 	ticketClosed      = "已关闭"
 	ticketCancelled   = "已取消"
 
@@ -27,6 +28,17 @@ const (
 	eventClose  = "关闭"
 	eventCancel = "取消"
 	eventAssign = "派工"
+
+	eventSubmit = "提交"
+	eventAccept = "验收"
+
+	// 验收决定：通过后工单按该次提交的维修结果关闭，退回后工单恢复未关闭。
+	decisionApprove = "通过"
+	decisionReject  = "退回"
+
+	// derivedApproved 是校验重放时的中间态：验收通过已发生、关闭履历尚未出现。
+	// 它只存在于验收履历与紧随的关闭履历之间，绝不会作为保存状态出现。
+	derivedApproved = "验收通过待关闭"
 
 	eventDeactivate = "停用"
 	eventReactivate = "恢复使用"
@@ -82,7 +94,7 @@ type Ticket struct {
 	ReportLocation string `json:"report_location,omitempty"`
 }
 
-// Event 为履历条目（报修/派工/关闭/取消/停用/恢复使用/位置变更/保养建立/保养完成/保养撤销/保养调整/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
+// Event 为履历条目（报修/派工/关闭/取消/提交/验收/停用/恢复使用/位置变更/保养建立/保养完成/保养撤销/保养调整/领用/退回/附件登记/附件撤销），Seq 决定操作发生顺序。
 // From/To 在派工履历中为原负责人（首次派工为空，展示为“未派工”）与新负责人；
 // 在停用、恢复使用履历中为原资产状态与新资产状态；
 // 在位置变更履历中为原位置与新位置（资产级履历，不属于任何工单）。
@@ -98,6 +110,10 @@ type Ticket struct {
 // 数量与所属领用编号；Content 分别为领用说明与退回理由。
 // AttachmentID/Path 仅附件履历使用：登记与撤销履历都携带附件编号与保存的绝对
 // 路径；Content 分别为附件说明与撤销理由。
+// 提交履历（提交）的 Content 为该次提交的维修结果，其全库序号即提交身份（提交
+// 序号）。验收履历（验收）的 Content 为验收意见，Decision 为决定（通过/退回），
+// TargetSeq 为目标提交的全库履历序号；仅当前待验收提交可被验收。验收通过在追加
+// 验收履历的同时沿用一条关闭履历（内容为该次提交的维修结果）终结工单。
 type Event struct {
 	Seq          int       `json:"-"`
 	AssetID      string    `json:"-"`
@@ -110,6 +126,7 @@ type Event struct {
 	Done         string    `json:"-"`
 	Interval     int       `json:"-"`
 	TargetSeq    int       `json:"-"`
+	Decision     string    `json:"-"`
 	NewContent   string    `json:"-"`
 	OldContent   string    `json:"-"`
 	OldDue       string    `json:"-"`
@@ -136,6 +153,7 @@ type eventJSON struct {
 	Done         string `json:"done,omitempty"`
 	Interval     int    `json:"interval,omitempty"`
 	TargetSeq    int    `json:"target_seq,omitempty"`
+	Decision     string `json:"decision,omitempty"`
 	NewContent   string `json:"new_content,omitempty"`
 	OldContent   string `json:"old_content,omitempty"`
 	OldDue       string `json:"old_due,omitempty"`
@@ -154,6 +172,7 @@ func (e Event) toJSON() eventJSON {
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
 		Due: e.Due, Done: e.Done, Interval: e.Interval, TargetSeq: e.TargetSeq,
+		Decision:   e.Decision,
 		NewContent: e.NewContent, OldContent: e.OldContent,
 		OldDue: e.OldDue, OldInterval: e.OldInterval, OldNextDue: e.OldNextDue,
 		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
@@ -174,6 +193,7 @@ func (e eventJSON) toEvent() (Event, error) {
 		Seq: e.Seq, AssetID: e.AssetID, TicketID: e.TicketID,
 		Kind: e.Kind, Content: e.Content, From: e.From, To: e.To,
 		Due: e.Due, Done: e.Done, Interval: e.Interval, TargetSeq: e.TargetSeq,
+		Decision:   e.Decision,
 		NewContent: e.NewContent, OldContent: e.OldContent,
 		OldDue: e.OldDue, OldInterval: e.OldInterval, OldNextDue: e.OldNextDue,
 		PartID: e.PartID, Quantity: e.Quantity, WithdrawalID: e.WithdrawalID,
@@ -408,7 +428,7 @@ func validateData(d *storeData) error {
 		if n > maxTicketSeq {
 			maxTicketSeq = n
 		}
-		if t.Status != ticketOpen && t.Status != ticketClosed && t.Status != ticketCancelled {
+		if t.Status != ticketOpen && t.Status != ticketPending && t.Status != ticketClosed && t.Status != ticketCancelled {
 			return fmt.Errorf("状态矛盾：工单 %s 状态无效 %q", t.ID, t.Status)
 		}
 		if assets[t.AssetID] == nil {
@@ -556,23 +576,23 @@ func validateData(d *storeData) error {
 			return fmt.Errorf("请求绑定矛盾：工单 %s 缺少对应的报修请求绑定", t.ID)
 		}
 	}
-	// 状态：每项资产最多一张未关闭工单，有则必须为“维修中”；无未关闭工单时
-	// 资产可为“可用”或“停用”，停用与否由停用、恢复使用履历链决定，在下方
-	// 按履历序号重放时核对。
+	// 状态：每项资产最多一张未终结工单（未关闭或待验收），有则必须为“维修中”；
+	// 无未终结工单时资产可为“可用”或“停用”，停用与否由停用、恢复使用履历链
+	// 决定，在下方按履历序号重放时核对。
 	openCount := map[string]int{}
 	for _, t := range d.Tickets {
-		if t.Status == ticketOpen {
+		if t.Status == ticketOpen || t.Status == ticketPending {
 			openCount[t.AssetID]++
 		}
 	}
 	for _, a := range d.Assets {
 		c := openCount[a.ID]
 		if c > 1 {
-			return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未关闭工单，最多允许一张", a.ID, c)
+			return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未终结工单，最多允许一张", a.ID, c)
 		}
 		if c == 1 {
 			if a.Status != statusRepairing {
-				return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未关闭工单，状态应为 %s，实际为 %s",
+				return fmt.Errorf("状态矛盾：资产 %s 有 %d 张未终结工单，状态应为 %s，实际为 %s",
 					a.ID, c, statusRepairing, a.Status)
 			}
 			continue
@@ -732,9 +752,22 @@ func validateData(d *storeData) error {
 		if e.TicketID == "" {
 			return errors.New("履历矛盾：存在字段不完整的履历记录")
 		}
-		if e.Due != "" || e.Done != "" || e.Interval != 0 || e.TargetSeq != 0 ||
+		if e.Due != "" || e.Done != "" || e.Interval != 0 ||
 			e.NewContent != "" || e.OldContent != "" || e.OldDue != "" || e.OldInterval != 0 || e.OldNextDue != "" {
 			return fmt.Errorf("履历矛盾：履历序号 %d 的维修履历不应带有保养字段", e.Seq)
+		}
+		// 目标提交序号与验收决定仅验收履历携带；提交履历的内容即维修结果（非空
+		// 已检查），验收履历的内容即验收意见（非空已检查）。
+		if e.Kind != eventAccept && (e.TargetSeq != 0 || e.Decision != "") {
+			return fmt.Errorf("履历矛盾：履历序号 %d 的 %s 记录不应带有目标提交序号或验收决定", e.Seq, e.Kind)
+		}
+		if e.Kind == eventAccept {
+			if e.Decision != decisionApprove && e.Decision != decisionReject {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的验收记录决定无效 %q", e.Seq, e.Decision)
+			}
+			if e.TargetSeq < 1 {
+				return fmt.Errorf("履历矛盾：履历序号 %d 的验收记录目标提交序号须为正整数", e.Seq)
+			}
 		}
 		if e.Kind != eventAssign && (e.From != "" || e.To != "") {
 			return fmt.Errorf("履历矛盾：履历序号 %d 的 %s 记录不应带有派工人员字段", e.Seq, e.Kind)
@@ -785,6 +818,12 @@ func validateData(d *storeData) error {
 		case eventAssign:
 			// 内容即派工说明（非空已检查）；派工链的接续与工单负责人一致性
 			// 在下方按序号重放时核对。
+		case eventSubmit:
+			// 内容即提交的维修结果（非空已检查）；提交转换（未关闭 -> 待验收）
+			// 在下方按序号重放时核对。
+		case eventAccept:
+			// 内容即验收意见（非空已检查），决定与目标提交序号已在上方核对；
+			// 仅当前待验收提交可处理的接续规则在下方按序号重放时核对。
 		case eventPartWithdraw, eventPartReturn:
 			// 内容即领用说明或退回理由（非空已检查）；备件字段在此核对，
 			// 与领用记录的接续及累计退回在下方按序号重放时核对。
@@ -876,6 +915,13 @@ func validateData(d *storeData) error {
 	derivedDeactivated := map[string]bool{}
 	derivedAssignee := map[string]string{}
 	derivedNote := map[string]string{}
+	// 提交验收链：submittedEver 记录工单是否曾提交（首次提交后只能验收通过或
+	// 取消终结）；pendingSeq/pendingResult 为当前待验收提交的履历序号与维修
+	// 结果；approvedResult 为验收通过待关闭时该次提交的维修结果。
+	submittedEver := map[string]bool{}
+	pendingSeq := map[string]int{}
+	pendingResult := map[string]string{}
+	approvedResult := map[string]string{}
 	withdrawSeq := map[string]int{}
 	derivedReturned := map[string]int{}
 	attachRegSeq := map[string]int{}
@@ -947,17 +993,64 @@ func validateData(d *storeData) error {
 			derivedAssignee[e.TicketID] = e.To
 			derivedNote[e.TicketID] = e.Content
 		case eventClose:
-			if derivedTicket[e.TicketID] != ticketOpen {
+			switch derivedTicket[e.TicketID] {
+			case ticketOpen:
+				// 从未提交的工单可按原 close 直接关闭；首次提交后只能验收
+				// 通过或取消终结，退回后也不能绕过验收直接关闭。
+				if submittedEver[e.TicketID] {
+					return fmt.Errorf("履历矛盾：工单 %s 首次提交后只能验收通过或取消终结，却出现直接关闭履历（序号 %d）",
+						e.TicketID, e.Seq)
+				}
+			case derivedApproved:
+				// 验收通过后的关闭履历：维修结果取该次提交内容。
+				if e.Content != approvedResult[e.TicketID] {
+					return fmt.Errorf("履历矛盾：工单 %s 的关闭履历（序号 %d）内容与验收通过的提交维修结果不一致",
+						e.TicketID, e.Seq)
+				}
+			default:
 				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现关闭履历", e.TicketID)
 			}
 			derivedTicket[e.TicketID] = ticketClosed
 			delete(derivedOpen, e.AssetID)
 		case eventCancel:
-			if derivedTicket[e.TicketID] != ticketOpen {
-				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现取消履历", e.TicketID)
+			// 未关闭与待验收工单均可取消；待验收取消保留提交且不填写维修结果。
+			if derivedTicket[e.TicketID] != ticketOpen && derivedTicket[e.TicketID] != ticketPending {
+				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭或待验收状态时出现取消履历", e.TicketID)
 			}
 			derivedTicket[e.TicketID] = ticketCancelled
 			delete(derivedOpen, e.AssetID)
+		case eventSubmit:
+			// 仅未关闭工单可提交；成功后工单转为待验收，提交履历的全库序号
+			// 即该次提交的身份。
+			if derivedTicket[e.TicketID] != ticketOpen {
+				return fmt.Errorf("履历矛盾：工单 %s 在未处于未关闭状态时出现提交履历（序号 %d）",
+					e.TicketID, e.Seq)
+			}
+			derivedTicket[e.TicketID] = ticketPending
+			pendingSeq[e.TicketID] = e.Seq
+			pendingResult[e.TicketID] = e.Content
+			submittedEver[e.TicketID] = true
+		case eventAccept:
+			// 仅当前待验收提交可被验收：目标序号须等于当前待验收提交的履历
+			// 序号；未知序号、非提交序号、跨单、已处理或非当前提交均不接续。
+			if derivedTicket[e.TicketID] != ticketPending {
+				return fmt.Errorf("履历矛盾：工单 %s 在未处于待验收状态时出现验收履历（序号 %d）",
+					e.TicketID, e.Seq)
+			}
+			if e.TargetSeq != pendingSeq[e.TicketID] {
+				return fmt.Errorf("履历矛盾：验收履历（序号 %d）的目标提交序号 %d 与工单 %s 当前待验收提交（序号 %d）不符",
+					e.Seq, e.TargetSeq, e.TicketID, pendingSeq[e.TicketID])
+			}
+			if e.Decision == decisionApprove {
+				// 通过：进入待关闭中间态，随后由关闭履历终结（同一原子保存）。
+				derivedTicket[e.TicketID] = derivedApproved
+				approvedResult[e.TicketID] = pendingResult[e.TicketID]
+			} else {
+				// 退回：恢复未关闭，资产仍为维修中，可再次提交并产生新序号。
+				derivedTicket[e.TicketID] = ticketOpen
+			}
+			delete(pendingSeq, e.TicketID)
+			delete(pendingResult, e.TicketID)
 		case eventPartWithdraw:
 			// 领用须在报修之后、终结之前；履历与领用记录的业务字段必须一致。
 			if derivedTicket[e.TicketID] != ticketOpen {
@@ -1303,9 +1396,11 @@ func (s *store) findRequest(requestID string) *requestBinding {
 	return nil
 }
 
+// openTicketOf 返回资产当前未终结（未关闭或待验收）的工单；待验收工单仍占用
+// 资产，因此报修、停用、恢复使用与详情展示都把待验收视为未终结。
 func (s *store) openTicketOf(assetID string) *Ticket {
 	for _, t := range s.data.Tickets {
-		if t.AssetID == assetID && t.Status == ticketOpen {
+		if t.AssetID == assetID && (t.Status == ticketOpen || t.Status == ticketPending) {
 			return t
 		}
 	}
@@ -1424,7 +1519,8 @@ func (s *store) report(assetID, description, requestID string) (*Ticket, bool, e
 	return t, false, nil
 }
 
-// closeTicket 关闭未关闭工单并把资产恢复为可用。
+// closeTicket 关闭未关闭工单并把资产恢复为可用。仅从未提交的工单可直接关闭；
+// 首次提交后只能验收通过或取消终结（退回后也不能绕过验收直接关闭）。
 // 失败路径不修改任何业务数据。
 func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 	t := s.findTicket(ticketID)
@@ -1434,8 +1530,14 @@ func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 	if t.Status == ticketCancelled {
 		return nil, nil, fmt.Errorf("%w: 工单 %s 已取消，不能关闭", errConflict, ticketID)
 	}
+	if t.Status == ticketPending {
+		return nil, nil, fmt.Errorf("%w: 工单 %s 处于待验收，须验收通过或取消终结，不能直接关闭", errConflict, ticketID)
+	}
 	if t.Status != ticketOpen {
 		return nil, nil, fmt.Errorf("%w: 工单 %s 已关闭，不能重复关闭", errConflict, ticketID)
+	}
+	if s.hasSubmission(ticketID) {
+		return nil, nil, fmt.Errorf("%w: 工单 %s 已提交过维修，不能直接关闭，须重新提交并验收通过或取消", errConflict, ticketID)
 	}
 	asset := s.findAsset(t.AssetID)
 	if asset == nil {
@@ -1453,9 +1555,9 @@ func (s *store) closeTicket(ticketID, result string) (*Ticket, *Asset, error) {
 	return t, asset, nil
 }
 
-// cancelTicket 取消未关闭工单并把资产恢复为可用。取消是终态，但不代表维修完成：
-// 不填写维修结果，不删除工单、履历或请求绑定，工单编号不回退也不复用。
-// 失败路径不修改任何业务数据。
+// cancelTicket 取消未关闭或待验收工单并把资产恢复为可用。取消是终态，但不代表
+// 维修完成：不填写维修结果，不删除工单、履历（含全部提交与验收履历）或请求
+// 绑定，工单编号不回退也不复用。失败路径不修改任何业务数据。
 func (s *store) cancelTicket(ticketID, reason string) (*Ticket, *Asset, error) {
 	t := s.findTicket(ticketID)
 	if t == nil {
@@ -1498,6 +1600,9 @@ func (s *store) assignTicket(ticketID, assignee, note string) (*Ticket, error) {
 	}
 	if t.Status == ticketCancelled {
 		return nil, fmt.Errorf("%w: 工单 %s 已取消，不能派工", errConflict, ticketID)
+	}
+	if t.Status == ticketPending {
+		return nil, fmt.Errorf("%w: 工单 %s 处于待验收，不能派工", errConflict, ticketID)
 	}
 	if assignee == "" {
 		return nil, fmt.Errorf("%w: 维修人员标识不能为空", errConflict)

@@ -27,8 +27,10 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   report     对资产报修，创建工单，资产转为“维修中”
   batch-report 按本地 JSON 清单文件批量报修，一次提交多项设备故障（清单只读，整批原子生效）
   assign     为未关闭工单派工或转派维修人员
-  ticket     按工单编号查询工单状态与负责人
-  close      关闭工单并填写维修结果，设备恢复“可用”
+  ticket     按工单编号查询工单状态与负责人（含当前待验收提交的序号与结果）
+  submit     提交未关闭工单的维修结果，工单转为“待验收”，返回提交序号
+  accept     验收当前待验收提交：通过后按提交结果关闭工单，退回后恢复未关闭
+  close      关闭工单并填写维修结果，设备恢复“可用”（已提交过的工单须验收通过）
   cancel     取消误报或不再需要维修的未关闭工单，设备恢复“可用”
   deactivate 停用“可用”且无未关闭工单的资产（记录理由，不创建工单）
   reactivate 恢复使用已停用的资产（记录理由，历史记录保留）
@@ -59,6 +61,9 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   batch-report --file 清单文件                              [--data-dir 目录]
   assign   --ticket-id 工单编号 --assignee 维修人员 --note 说明  [--data-dir 目录]
   ticket   --ticket-id 工单编号                                 [--data-dir 目录]
+  submit   --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
+  accept   --ticket-id 工单编号 --seq 提交序号 --decision 通过|退回
+           --comment 验收意见                                  [--data-dir 目录]
   close    --ticket-id 工单编号 --repair-result 维修结果       [--data-dir 目录]
   cancel   --ticket-id 工单编号 --reason 取消理由              [--data-dir 目录]
   deactivate --asset-id 编号 --reason 停用理由                [--data-dir 目录]
@@ -122,7 +127,22 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     不改变资产状态或报修请求绑定；未知工单、空人员或说明、重复派给当前
     人员、对已关闭或已取消工单派工均失败且不产生履历。工单关闭或取消后
     保留最后负责人与派工履历。
-  - 仅未关闭工单可关闭，维修结果不能为空；未知工单、重复关闭均失败。
+  - 仅未关闭工单可关闭，维修结果不能为空；未知工单、重复关闭均失败。从未提交
+    过的工单可直接关闭；首次提交后只能验收通过或取消终结，退回后也不能绕过
+    验收直接关闭。
+  - 维修提交与验收（可选择启用的验收流程）：submit 输入工单编号与非空维修结果，
+    仅“未关闭”工单可提交，成功后工单转为“待验收”，追加一条提交履历并返回其
+    全库序号作为提交身份。accept 输入工单编号、目标提交序号、决定（通过/退回）
+    与非空意见，仅当前待验收提交可处理；未知工单或序号、非提交序号、跨单、
+    已处理或非当前提交均拒绝。每次验收追加一条含决定、意见与目标序号的验收
+    履历：通过后沿用一条关闭履历（维修结果取该次提交内容）终结工单，资产恢复
+    可用；退回后工单恢复未关闭，资产仍为维修中，可再次提交并产生新序号；旧
+    提交与意见全部保留。待验收工单仍占用资产：拒绝新报修、停用、派工、转派、
+    备件领用退回与重复提交，旧请求重放只读返回原单当前状态；等待与返修时间
+    均计入原报修至终结的停机区间。待验收工单可取消（保留提交且不填写维修
+    结果）；工单终结后拒绝提交与验收。提交、验收各为一次原子保存，保存后才
+    输出成功；校验、履历容量或读写失败保持原文件字节，不留部分状态或履历、
+    不消耗编号，恢复后可重试。
   - 仅未关闭工单可取消，取消理由不能为空；取消后工单进入“已取消”终态，保存取消
     理由与时间，资产恢复“可用”，可再次报修。取消不代表维修完成，不填写维修结果，
     不删除工单、履历或请求绑定，工单编号不回退也不复用；已取消工单不能关闭或再次
@@ -339,6 +359,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdTicket(args[1:], stdout)
 	case "close":
 		err = cmdClose(args[1:], stdout)
+	case "submit":
+		err = cmdSubmit(args[1:], stdout)
+	case "accept":
+		err = cmdAccept(args[1:], stdout)
 	case "cancel":
 		err = cmdCancel(args[1:], stdout)
 	case "deactivate":
@@ -656,6 +680,15 @@ func cmdTicket(args []string, w io.Writer) error {
 	// 旧库缺少该字段时按履历序号现场追溯，只读不补写。
 	fmt.Fprintf(w, "报修地点: %s\n", s.reportLocationOf(t))
 	fmt.Fprintf(w, "工单状态: %s\n", t.Status)
+	// 待验收提交：显示当前待验收提交的序号与维修结果；无待验收提交时明确提示。
+	if t.Status == ticketPending {
+		if seq, result, ok := s.currentSubmission(t.ID); ok {
+			fmt.Fprintf(w, "待验收提交序号: %d\n", seq)
+			fmt.Fprintf(w, "待验收提交结果: %s\n", result)
+		}
+	} else {
+		fmt.Fprintln(w, "待验收提交: 无")
+	}
 	fmt.Fprintf(w, "负责人: %s\n", assigneeDisplay(t.Assignee))
 	if t.Assignee != "" {
 		fmt.Fprintf(w, "派工时间: %s\n", t.AssignedAt)
@@ -696,6 +729,87 @@ func cmdTicket(args []string, w io.Writer) error {
 			fmt.Fprintf(w, "%s\t%s\t%s\t有效（文件不可用）\n", a.ID, a.Path, a.Note)
 		}
 	}
+	return nil
+}
+
+// cmdSubmit 提交未关闭工单的维修结果：工单转为待验收，返回提交履历的全库序号
+// 作为提交身份。一次原子保存后才输出成功。
+func cmdSubmit(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var ticketID, result string
+	fs := newFlagSet("submit", &opts)
+	fs.StringVar(&ticketID, "ticket-id", "", "要提交维修结果的工单编号（必填，仅未关闭工单）")
+	fs.StringVar(&result, "repair-result", "", "维修结果（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, ticketID, "ticket-id"); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, result, "repair-result"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	t, seq, err := s.submitRepair(ticketID, result)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "工单编号: %s\n", t.ID)
+	fmt.Fprintf(w, "提交序号: %d\n", seq)
+	fmt.Fprintf(w, "工单状态: %s\n", t.Status)
+	return nil
+}
+
+// cmdAccept 验收工单当前待验收提交：通过后按该次提交的维修结果关闭工单，资产
+// 恢复可用；退回后工单恢复未关闭，资产仍为维修中，可再次提交。一次原子保存后
+// 才输出成功，显示工单编号及新状态。
+func cmdAccept(args []string, w io.Writer) error {
+	var opts cmdOptions
+	var ticketID, decision, comment string
+	var seq int
+	fs := newFlagSet("accept", &opts)
+	fs.StringVar(&ticketID, "ticket-id", "", "要验收的工单编号（必填，须处于待验收）")
+	fs.IntVar(&seq, "seq", 0, "目标提交序号（必填，正整数；须为当前待验收提交）")
+	fs.StringVar(&decision, "decision", "", "验收决定（必填：通过 或 退回）")
+	fs.StringVar(&comment, "comment", "", "验收意见（必填，非空）")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requireFlag(fs, ticketID, "ticket-id"); err != nil {
+		return err
+	}
+	if seq < 1 {
+		return &usageError{msg: "--seq 须为正整数（目标提交序号）"}
+	}
+	if decision != decisionApprove && decision != decisionReject {
+		return &usageError{msg: "--decision 须为 通过 或 退回"}
+	}
+	if err := requireFlag(fs, comment, "comment"); err != nil {
+		return err
+	}
+
+	s, err := openStore(opts.dataDir)
+	if err != nil {
+		return err
+	}
+	t, asset, err := s.acceptSubmission(ticketID, seq, decision, comment)
+	if err != nil {
+		return err
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "工单 %s 验收完成。\n", t.ID)
+	fmt.Fprintf(w, "决定: %s\n", decision)
+	fmt.Fprintf(w, "工单状态: %s\n", t.Status)
+	fmt.Fprintf(w, "资产 %s 当前状态: %s\n", asset.ID, asset.Status)
 	return nil
 }
 
@@ -1303,6 +1417,12 @@ func cmdHistory(args []string, w io.Writer) error {
 		case eventAssign:
 			fmt.Fprintf(w, "[%s] 序号 %d: %s 工单 %s: %s -> %s（%s）\n",
 				ts, e.Seq, e.Kind, e.TicketID, assigneeDisplay(e.From), e.To, e.Content)
+		case eventSubmit:
+			fmt.Fprintf(w, "[%s] 序号 %d: %s 工单 %s: %s\n",
+				ts, e.Seq, e.Kind, e.TicketID, e.Content)
+		case eventAccept:
+			fmt.Fprintf(w, "[%s] 序号 %d: %s 工单 %s: %s，目标提交序号 %d（%s）\n",
+				ts, e.Seq, e.Kind, e.TicketID, e.Decision, e.TargetSeq, e.Content)
 		case eventPlanCreate:
 			fmt.Fprintf(w, "[%s] 序号 %d: %s: %s（首次到期日 %s，每 %d 天）\n",
 				ts, e.Seq, e.Kind, e.Content, e.Due, e.Interval)

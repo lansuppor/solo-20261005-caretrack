@@ -41,12 +41,17 @@ type replaySnapshot struct {
 	plan       *replayPlan
 }
 
-// replayTicket 为截止处仍未关闭工单的回看信息；报修地点为报修履历序号当时
-// 的资产位置，维修中搬移不改变它。
+// replayTicket 为截止处仍未终结工单的回看信息；报修地点为报修履历序号当时
+// 的资产位置，维修中搬移不改变它。status 为截止处的工单状态（未关闭或待验收）；
+// 待验收时 submitSeq/submitResult 为当时待验收提交的履历序号与维修结果，
+// 截止之后的验收（通过或退回）不提前生效。
 type replayTicket struct {
 	id             string
 	assignee       string
 	reportLocation string
+	status         string
+	submitSeq      int
+	submitResult   string
 }
 
 // replayPlan 为截止处的方案段状态：内容/首次到期日/间隔为当时所在段的方案，
@@ -82,7 +87,10 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 	sort.SliceStable(events, func(i, j int) bool { return events[i].Seq < events[j].Seq })
 
 	var openID string
+	openStatus := ""
 	assignee := ""
+	submitSeq := 0
+	submitResult := ""
 	deactivated := false
 	core := newMaintCore()
 	for _, e := range events {
@@ -90,15 +98,35 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 		case eventReport:
 			// 整库一致性已保证同一资产前一张工单终结后才会产生新报修。
 			openID = e.TicketID
+			openStatus = ticketOpen
 			assignee = ""
+			submitSeq = 0
+			submitResult = ""
 		case eventAssign:
 			if e.TicketID == openID {
 				assignee = e.To
 			}
+		case eventSubmit:
+			if e.TicketID == openID {
+				openStatus = ticketPending
+				submitSeq = e.Seq
+				submitResult = e.Content
+			}
+		case eventAccept:
+			// 退回恢复未关闭；通过后紧随的关闭履历会终结工单，截止落在两者
+			// 之间时保持待验收（后续关闭不提前生效）。
+			if e.TicketID == openID && e.Decision == decisionReject {
+				openStatus = ticketOpen
+				submitSeq = 0
+				submitResult = ""
+			}
 		case eventClose, eventCancel:
 			if e.TicketID == openID {
 				openID = ""
+				openStatus = ""
 				assignee = ""
+				submitSeq = 0
+				submitResult = ""
 			}
 		case eventRelocate:
 			snap.location = e.To
@@ -125,6 +153,9 @@ func (s *store) replayAsset(assetID string, cutoff int) *replaySnapshot {
 			id:             openID,
 			assignee:       assignee,
 			reportLocation: s.locationAtSeq(assetID, s.ticketReportSeq(assetID, openID, cutoff)),
+			status:         openStatus,
+			submitSeq:      submitSeq,
+			submitResult:   submitResult,
 		}
 	}
 	if content, firstDue, interval, nextDue, created := core.derived(assetID); created {
@@ -161,6 +192,11 @@ func printReplay(w io.Writer, snap *replaySnapshot) {
 		fmt.Fprintln(w, "当时未关闭工单: 无")
 	} else {
 		fmt.Fprintf(w, "当时未关闭工单: %s\n", snap.openTicket.id)
+		fmt.Fprintf(w, "工单状态: %s\n", snap.openTicket.status)
+		if snap.openTicket.status == ticketPending {
+			fmt.Fprintf(w, "待验收提交序号: %d\n", snap.openTicket.submitSeq)
+			fmt.Fprintf(w, "待验收提交结果: %s\n", snap.openTicket.submitResult)
+		}
 		fmt.Fprintf(w, "工单负责人: %s\n", assigneeDisplay(snap.openTicket.assignee))
 		fmt.Fprintf(w, "报修地点: %s\n", snap.openTicket.reportLocation)
 	}
