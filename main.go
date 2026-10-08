@@ -38,6 +38,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
   plan       为资产建立唯一的周期保养计划（不可覆盖）
   adjust     调整已有计划的保养方案（更换内容、周期起点与间隔，保留原保养记录）
   maintain   登记当前周期的保养完成，推进下一到期日，显示完成履历序号
+  batch-maintain 按本地 JSON 清单文件批量登记保养完成（清单只读，整批原子生效）
   unmaintain 按完成履历序号撤销误登记的保养完成，恢复下一到期日
   due        按指定日期列出到期的保养计划（只读）
   withdraw   为未关闭工单领用备件，生成领用编号
@@ -76,6 +77,7 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
            --interval-days 新间隔天数 --reason 调整理由      [--data-dir 目录]
   maintain --asset-id 编号 --due 周期到期日 --done 实际完成日 --result 结果
                                                               [--data-dir 目录]
+  batch-maintain --file 清单文件                            [--data-dir 目录]
   unmaintain --asset-id 编号 --seq 完成履历序号 --reason 理由  [--data-dir 目录]
   due      --date 日期                                        [--data-dir 目录]
   withdraw --ticket-id 工单编号 --part-id 备件编号 --quantity 数量 --note 说明
@@ -197,6 +199,23 @@ const helpText = `caretrack — 本地设备资产登记与维修工单闭环工
     日为首次到期日加整数倍间隔所得日期中严格晚于完成日的最早日期；延期跨过的
     周期不生成完成记录，也不改用完成日加间隔。若下一到期日超出 9999-12-31，整次
     拒绝。输出完成周期、完成履历的全库序号与下一到期日。
+  - batch-maintain 从 --file 指定的本地 JSON 清单批量登记保养完成（清单只读，
+    不修改）：清单为 JSON 数组，每项含非空 asset_id（资产编号）、result（保养
+    结果），YYYY-MM-DD 形式的 due（周期到期日）与 done（实际完成日，0001 至
+    9999 年有效公历日期），以及正整数 segment_seq（方案段序号）。方案段以本
+    数据目录中该资产建立或调整履历的全库序号标识（history 可查）；只接受资产
+    的当前段，同日期的旧段也拒绝。空清单、JSON 格式错误、含未知字段、缺项、
+    段序号非正整数或非法日期均整批拒绝（退出码 2），指出涉及的项号。
+    按清单顺序处理，允许资产交错及同一资产多次出现：每项 due 须等于处理该项
+    时的下一到期日（后项接续前项推进后的日期），done 不得早于 due，下一到期
+    日按当前段首次日加整数倍间隔推进到严格晚于完成日的最早日期，延期跳过的
+    周期不补记录，超出 9999-12-31 整批拒绝。未知资产、无计划、停用资产拒绝；
+    维修中（含待验收）仍可登记，工单及资产状态不变。清单项不合并、不按报修
+    请求标识去重，重复周期整批失败。每项追加普通保养完成履历，按清单顺序分配
+    全库序号，不追加批次事件；一次原子保存后逐项显示项号、资产、周期、完成
+    序号及该项推进后的日期，detail、due 显示最终日期，replay 反映各项进度。
+    任一项失败、容量不足或读写失败无部分成功输出：台账与清单字节保持，不推进
+    计划、不留履历、不消耗序号，重载并恢复条件后可用原清单重试。
   - unmaintain 撤销误登记的保养完成：--seq 为目标完成履历的全库序号（完成身份以此
     序号标识，不能用到期日或报修请求标识代替），--reason 理由非空。仅可撤销该资产
     当前方案段内按序号最新的未撤销完成：存在更晚有效完成时拒绝；调整前旧段的完成
@@ -377,6 +396,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdAdjust(args[1:], stdout)
 	case "maintain":
 		err = cmdMaintain(args[1:], stdout)
+	case "batch-maintain":
+		err = cmdBatchMaintain(args[1:], stdout)
 	case "unmaintain":
 		err = cmdUnmaintain(args[1:], stdout)
 	case "due":

@@ -120,6 +120,48 @@ caretrack maintain --asset-id EQ-001 --due 2026-11-01 --done 2026-11-03 --result
 - 建立与完成各为一次原子保存：校验、履历容量或读写失败时保留原文件，不推进
   日期、不新增履历，恢复后可重试。
 
+### 批量登记保养完成（本地清单）
+
+```sh
+caretrack batch-maintain --file 保养清单.json
+```
+
+按本地 JSON 清单一次登记多项周期保养完成，整批原子生效。清单为本地 JSON
+文件（**只读**，不会被修改），内容为一个 JSON 数组，每项包含资产编号、周期
+到期日、实际完成日、保养结果与方案段序号五个字段：
+
+```json
+[
+  {"asset_id": "EQ-001", "due": "2026-11-01", "done": "2026-11-03", "result": "已更换滤芯", "segment_seq": 12},
+  {"asset_id": "EQ-002", "due": "2026-12-01", "done": "2026-12-01", "result": "清洗完成", "segment_seq": 15}
+]
+```
+
+- 字段含义与校验：
+  - `asset_id` 资产编号、`result` 保养结果均须非空；日期 `due`/`done` 为
+    0001 至 9999 年的有效公历日期（YYYY-MM-DD）。
+  - `segment_seq` 为**方案段序号**（正整数）：方案段以本数据目录中该资产
+    “保养建立/保养调整”履历的全库序号标识，可由 `history` 查看。只接受资产
+    的**当前段**；即使旧段与当前段的首次到期日恰好相同（同日期的旧段），
+    旧段序号也被拒绝。
+  - 清单完整读取后校验：空清单、JSON 格式错误、含未知字段、缺项、段序号
+    不是正整数或日期非法均整批拒绝（退出码 2），并指出涉及的项号；清单
+    文件读取失败为退出码 1。
+- 业务处理严格按清单顺序进行，允许资产交错、同一资产在清单中多次出现：
+  - 每项 `due` 必须等于**处理该项时**该资产的下一到期日——后项接续前项
+    推进后的日期；`done` 不得早于 `due`。
+  - 下一到期日按当前段首次到期日加整数倍间隔，推进到严格晚于 `done` 的最早
+    日期；延期跳过的周期不补记录；推算结果超出 9999-12-31 整批拒绝。
+  - 未知资产、无计划、停用资产拒绝；维修中（含待验收）仍可登记，工单及
+    资产状态不变。
+  - 清单项**不合并、不按报修请求标识去重**；同一周期重复出现时，后项会
+    撞上已推进的下一到期日而整批失败。
+- 每项追加一条普通“保养完成”履历，按清单顺序分配全库履历序号，不追加批次
+  事件。整批一次原子保存后，逐项显示项号、资产、周期到期日、完成序号及该项
+  推进后的下一到期日；`detail`、`due` 显示最终日期，`replay` 反映各项进度。
+- 任一项失败、容量不足或读写失败均无部分成功输出：台账与清单字节保持，
+  不推进计划、不留履历、不消耗序号；重载并恢复条件后可用**原清单**重试。
+
 ### 撤销保养完成
 
 ```sh
@@ -591,6 +633,7 @@ caretrack history  --data-dir $D --asset-id EQ-001
 caretrack downtime --data-dir $D --start 2026-10-01T00:00:00Z --end 2026-11-01T00:00:00Z
 caretrack plan     --data-dir $D --asset-id EQ-001 --content 更换滤芯 --first-due 2026-11-01 --interval-days 90
 caretrack maintain --data-dir $D --asset-id EQ-001 --due 2026-11-01 --done 2026-11-03 --result 已更换滤芯
+caretrack batch-maintain --data-dir $D --file 保养清单.json   # 按清单批量登记保养完成
 caretrack unmaintain --data-dir $D --asset-id EQ-001 --seq 12 --reason 误登记，实际未保养
 caretrack maintain --data-dir $D --asset-id EQ-001 --due 2026-11-01 --done 2026-11-04 --result 已更换滤芯
 caretrack adjust   --data-dir $D --asset-id EQ-001 --content 更换高效滤芯 --first-due 2027-01-01 --interval-days 60 --reason 滤芯型号升级
